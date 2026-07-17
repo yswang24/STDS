@@ -1,0 +1,17 @@
+[project]
+name = "stds"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "pydantic>=2",
+    "httpx>=0.24",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    "sse-starlette>=1.0",
+    "sqlalchemy>=2.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
