@@ -1,15 +1,17 @@
 """Streamlit UI:交互式工时分析系统。
 
 核心功能:
-  1. 输入操作描述 → 实时分析(chartcode/决策串/时间/trace)
-  2. 可修改结果并确认(飞轮回灌)
-  3. Prompt 编辑(侧边栏,热更新)
+  1. 上传 Excel → 批量分析 operation → 下载追加结果列的 Excel
+  2. 单条操作描述 → 实时分析(chartcode/决策串/时间/trace)
+  3. 可修改结果并确认(飞轮回灌)
+  4. Prompt 编辑(侧边栏,热更新)
 
 启动: cd stds_project && .venv/bin/python -m streamlit run stds/ui/app.py
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from pathlib import Path
 
 import streamlit as st
@@ -23,6 +25,7 @@ from stds.data.charts_loader import load_charts
 from stds.data.common_chart import load_common_chart
 from stds.domain.models import StdsElement, StdsResult
 from stds.llm.pick_value import pick_value
+from stds.pipeline.excel_batch import ExcelInputError, ExcelProgress, analyze_excel_bytes
 from stds.review.flywheel import on_review_confirmed
 
 # ---------- 初始化(缓存到 session_state) ----------
@@ -31,6 +34,8 @@ if "charts" not in st.session_state:
     st.session_state.cache = AutoCache()
     st.session_state.common_rows = load_common_chart()
     st.session_state.history = []  # 分析历史
+if "batch_output" not in st.session_state:
+    st.session_state.batch_output = None
 
 PROMPTS_DIR = Path(__file__).parent.parent / "llm" / "prompts"
 
@@ -70,7 +75,128 @@ with st.sidebar:
 # ========================================
 st.title("⏱️ STDS 工时分析系统")
 
-# ---------- 输入区 ----------
+# ---------- Excel 批量输入 ----------
+st.subheader("📤 Excel 批量分析")
+st.caption("工作簿需包含 operation 表头；系统会保留原内容，并追加决策串、逐步的决策选择（trace）、时间三列。")
+uploaded_file = st.file_uploader(
+    "上传 Excel 文件",
+    type=["xlsx"],
+    help="支持一个或多个含 operation 字段的工作表",
+)
+
+uploaded_bytes = uploaded_file.getvalue() if uploaded_file is not None else None
+uploaded_digest = hashlib.sha256(uploaded_bytes).hexdigest() if uploaded_bytes else None
+batch_submitted = st.button(
+    "🚀 开始批量分析",
+    type="primary",
+    disabled=uploaded_file is None,
+    key="analyze_excel",
+)
+
+if batch_submitted and uploaded_file is not None:
+    progress_bar = st.progress(0.0)
+    progress_text = st.empty()
+    progress_details = st.empty()
+    timing_rows = []
+
+    def update_batch_progress(progress: ExcelProgress):
+        progress_bar.progress(progress.completed_rows / progress.total_rows)
+        coverage = (
+            f"｜本次覆盖 {progress.affected_rows} 行"
+            if progress.affected_rows > 1
+            else ""
+        )
+        progress_text.text(
+            f"正在解析：{progress.completed_rows}/{progress.total_rows}"
+            f"｜本条 {progress.item_elapsed_s:.2f} 秒{coverage}"
+            f"｜累计 {progress.total_elapsed_s:.2f} 秒"
+        )
+        timing_rows.append(progress.as_preview())
+        progress_details.dataframe(
+            timing_rows,
+            hide_index=True,
+            width="stretch",
+            height=min(320, 38 + len(timing_rows) * 35),
+        )
+
+    try:
+        deps = Deps(
+            charts=st.session_state.charts,
+            cache=st.session_state.cache,
+            common_rows=st.session_state.common_rows,
+            llm_pick_value=pick_value,
+        )
+        batch_result = asyncio.run(
+            analyze_excel_bytes(
+                uploaded_bytes,
+                uploaded_file.name,
+                deps,
+                on_progress=update_batch_progress,
+            )
+        )
+        st.session_state.batch_output = {
+            "source_digest": uploaded_digest,
+            "filename": batch_result.output_filename,
+            "bytes": batch_result.output_bytes,
+            "preview": batch_result.preview_rows(),
+            "processed": batch_result.processed_count,
+            "review": batch_result.review_count,
+            "failed": batch_result.failed_count,
+            "total_count": batch_result.total_count,
+            "total_elapsed_s": batch_result.total_elapsed_s,
+            "average_elapsed_s": batch_result.average_elapsed_s,
+            "timings": batch_result.timing_rows(),
+        }
+    except ExcelInputError as exc:
+        st.session_state.batch_output = None
+        st.error(str(exc))
+    except Exception as exc:
+        st.session_state.batch_output = None
+        st.exception(exc)
+    finally:
+        progress_bar.empty()
+        progress_text.empty()
+        progress_details.empty()
+
+batch_output = st.session_state.batch_output
+if (
+    uploaded_file is not None
+    and batch_output is not None
+    and batch_output["source_digest"] == uploaded_digest
+):
+    if batch_output["failed"] or batch_output["review"]:
+        st.warning(
+            f"已处理 {batch_output['processed']} 条，待复核 {batch_output['review']} 条，"
+            f"失败 {batch_output['failed']} 条；原因已写入 trace 列。"
+        )
+    else:
+        st.success(f"已完成 {batch_output['processed']} 条 operation 解析")
+
+    total_col, elapsed_col, average_col = st.columns(3)
+    total_col.metric("总计条数", batch_output["total_count"])
+    elapsed_col.metric("总耗时", f"{batch_output['total_elapsed_s']:.2f} 秒")
+    average_col.metric("平均每条", f"{batch_output['average_elapsed_s']:.2f} 秒")
+
+    with st.expander("⏱️ 逐条处理耗时", expanded=False):
+        st.dataframe(
+            batch_output["timings"],
+            hide_index=True,
+            width="stretch",
+        )
+
+    st.dataframe(batch_output["preview"], width="stretch")
+    st.download_button(
+        "⬇️ 下载结果 Excel",
+        data=batch_output["bytes"],
+        file_name=batch_output["filename"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+
+st.divider()
+st.subheader("✍️ 单条分析（可选）")
+
+# ---------- 单条输入区 ----------
 # 使用表单配合单行输入框，让用户在“操作描述”中按 Enter 即可提交。
 with st.form("analysis_form"):
     col1, col2 = st.columns([3, 1])
@@ -188,4 +314,4 @@ if analyze_submitted and operation.strip():
 if st.session_state.history:
     st.divider()
     st.subheader("📜 分析历史")
-    st.dataframe(st.session_state.history, use_container_width=True)
+    st.dataframe(st.session_state.history, width="stretch")

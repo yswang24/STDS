@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 from stds.cascade import rules
@@ -40,6 +40,14 @@ class Deps:
             self.common_rows = load_common_chart()
 
 
+def _put_cache_template(el: StdsElement, result: StdsResult, deps: Deps, unit_time: float) -> None:
+    """缓存频率为 1 的模板，避免跨输入频率复用已乘频率/已舍入的总时间。"""
+    deps.cache.put(
+        el.norm_key,
+        replace(result, time_s=unit_time, freq=1.0),
+    )
+
+
 async def resolve(el: StdsElement, deps: Deps) -> StdsResult:
     """单条记录:从输入到产出。"""
     op = el.operation_des
@@ -49,7 +57,14 @@ async def resolve(el: StdsElement, deps: Deps) -> StdsResult:
     cached = deps.cache.get(el.norm_key)
     if cached is not None:
         logger.info(f"  [T0] 缓存命中: {cached.chartcode} / {cached.time_s}s")
-        return cached
+        # 新缓存恒为 freq=1；兼容当前进程里热更新前留下的旧缓存对象。
+        time_single = cached.time_s if cached.freq == 1.0 else cached.time_s / (cached.freq or 1.0)
+        return replace(
+            cached,
+            element=el,
+            time_s=round(time_single * el.freq, 2),
+            freq=el.freq,
+        )
     logger.debug(f"  [T0] 缓存未命中")
 
     # T0.5 common_chart 关键词匹配(33 条高频动作,零 LLM)
@@ -57,19 +72,22 @@ async def resolve(el: StdsElement, deps: Deps) -> StdsResult:
     if cc_hit and cc_hit.chartcode in deps.charts:
         chart = deps.charts[cc_hit.chartcode]
         try:
-            from stds.engine.decision_codec import decode
-            values, lc = decode(chart, cc_hit.decision)
+            from stds.engine.decision_codec import decode_with_trace
+            values, lc, decision_trace = decode_with_trace(chart, cc_hit.decision)
             time_single = evaluate(chart, values)
             logger.info(f"  [T0.5] common_chart 命中: {cc_hit.chartcode} / '{cc_hit.decision}' / {time_single}s (low_conf={lc})")
             res = StdsResult(
                 element=el, chartcode=cc_hit.chartcode, decision=cc_hit.decision,
                 time_s=round(time_single * el.freq, 2),
                 cv="C" if chart.value_added else "V", freq=el.freq,
-                source=Source.CACHE, confidence=0.95,
-                needs_review=False,
-                trace=[("T0.5_common", cc_hit.operation_des, f"keyword_match")],
+                source=Source.CACHE, confidence=0.6 if lc else 0.95,
+                needs_review=lc,
+                trace=[
+                    ("T0.5_common", cc_hit.operation_des, "keyword_match"),
+                    *decision_trace,
+                ],
             )
-            deps.cache.put(el.norm_key, res)
+            _put_cache_template(el, res, deps, time_single)
             return res
         except Exception as e:
             logger.warning(f"  [T0.5] decode 失败: {e},继续 T1")
@@ -85,18 +103,21 @@ async def resolve(el: StdsElement, deps: Deps) -> StdsResult:
             if consistent and top_cc in deps.charts:
                 chart = deps.charts[top_cc]
                 try:
-                    from stds.engine.decision_codec import decode
-                    values, lc = decode(chart, hits[0].decision)
+                    from stds.engine.decision_codec import decode_with_trace
+                    values, lc, decision_trace = decode_with_trace(chart, hits[0].decision)
                     time_single = evaluate(chart, values)
                     logger.info(f"  [T1] kNN 命中: {top_cc} / '{hits[0].decision}' / {time_single}s (score={hits[0].score:.3f}, low_conf={lc})")
                     res = StdsResult(
                         element=el, chartcode=top_cc, decision=hits[0].decision,
                         time_s=round(time_single * el.freq, 2),
                         cv="C" if chart.value_added else "V", freq=el.freq,
-                        source=Source.KNN, confidence=hits[0].score,
-                        needs_review=False, trace=[("T1_kNN", hits[0].text, f"score={hits[0].score:.3f}")],
+                        source=Source.KNN, confidence=min(hits[0].score, 0.6) if lc else hits[0].score,
+                        needs_review=lc, trace=[
+                            ("T1_kNN", hits[0].text, f"score={hits[0].score:.3f}"),
+                            *decision_trace,
+                        ],
                     )
-                    deps.cache.put(el.norm_key, res)
+                    _put_cache_template(el, res, deps, time_single)
                     return res
                 except Exception as e:
                     logger.warning(f"  [T1] decode 失败: {e},继续 T2")
@@ -149,6 +170,6 @@ async def resolve(el: StdsElement, deps: Deps) -> StdsResult:
         source=Source.FORMULA, confidence=conf,
         needs_review=conf < 0.75, trace=trace,
     )
-    deps.cache.put(el.norm_key, res)
+    _put_cache_template(el, res, deps, time_single)
     logger.info(f"  → 结果: {res.time_s}s (source={res.source.value}, needs_review={res.needs_review})")
     return res
