@@ -166,7 +166,7 @@ def test_resolver_end_to_end():
 
 
 def test_resolver_cache_hit():
-    """T0 缓存命中:第二次相同输入直接返回缓存结果。"""
+    """T0 缓存命中:复用决策，但按当前 element/freq 重算时间。"""
     import asyncio
 
     charts = load_charts()
@@ -183,10 +183,46 @@ def test_resolver_cache_hit():
 
     deps = Deps(charts=charts, cache=cache, llm_classify=mock_classify, llm_select_chartcode=mock_select_cc, llm_pick_value=pick_0)
     el = StdsElement(1, "扫描标签", "L", "S", freq=1.0, norm_key="扫描标签")
+    el_twice = StdsElement(2, "扫描标签", "L2", "S2", freq=2.0, norm_key="扫描标签")
 
     res1 = asyncio.run(resolve(el, deps))
-    res2 = asyncio.run(resolve(el, deps))
-    assert res1 is res2
+    res2 = asyncio.run(resolve(el_twice, deps))
+    assert res2 is not res1
+    assert res2.element is el_twice
+    assert res2.decision == res1.decision
+    assert res2.time_s == round(res1.time_s * 2, 2)
+    assert res2.freq == 2.0
+
+
+def test_resolver_cache_template_avoids_rounding_drift():
+    """小频率首次结果的舍入不能污染后续 freq=1 的缓存命中。"""
+    charts = load_charts()
+
+    async def mock_select_cc(op_des, charts):
+        return "020 130"
+
+    async def mock_classify(text):
+        return False
+
+    async def pick_0(op, cands):
+        return cands[0], 1.0, "mock"
+
+    def make_deps():
+        return Deps(
+            charts=charts,
+            cache=AutoCache(),
+            llm_classify=mock_classify,
+            llm_select_chartcode=mock_select_cc,
+            llm_pick_value=pick_0,
+        )
+
+    cached_deps = make_deps()
+    small = StdsElement(1, "cache-rounding", "L", "S", freq=0.1, norm_key="cache-rounding")
+    normal = StdsElement(2, "cache-rounding", "L", "S", freq=1.0, norm_key="cache-rounding")
+    asyncio.run(resolve(small, cached_deps))
+    cached_result = asyncio.run(resolve(normal, cached_deps))
+    fresh_result = asyncio.run(resolve(normal, make_deps()))
+    assert cached_result.time_s == fresh_result.time_s
 
 
 def test_resolver_unresolved_on_no_chartcode():

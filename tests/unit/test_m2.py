@@ -83,9 +83,11 @@ def test_flywheel_cache_hit():
     FakeDeps.goldens = []
 
     el = StdsElement(1, "扫码", "L", "S", norm_key="扫码")
-    result = StdsResult(el, "060 010", "LS,", 1.2, "V", 1.0, Source.FORMULA, 1.0, False)
+    result = StdsResult(el, "060 010", "LS,", 2.4, "V", 2.0, Source.FORMULA, 1.0, False)
     on_review_confirmed(el, result, FakeDeps())
-    assert cache.get("扫码") is result  # T0 命中
+    cached = cache.get("扫码")
+    assert cached is not result
+    assert cached.time_s == 1.2 and cached.freq == 1.0
     assert result.edited is True
 
 

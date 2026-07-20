@@ -52,10 +52,11 @@ def _default_option(cands: list) -> tuple:
     return min(cands, key=lambda o: o.formula_value), True
 
 
-def decode(chart: MostChart, decision: str) -> tuple:
-    """返回 (values: dict[int,float], low_conf: bool)。"""
+def _decode(chart: MostChart, decision: str) -> tuple:
+    """解码并保留每个变量的选择过程。"""
     tokens = [t.strip() for t in decision.split(",") if t.strip()]
     values: dict = {}
+    trace: list = []
     low_conf = False
     var, rng, visited, ti = 1, 1, set(), 0
     while var != 0:
@@ -66,16 +67,46 @@ def decode(chart: MostChart, decision: str) -> tuple:
         if not cands:
             raise EngineError(f"no cands {chart.chartcode} V{var}R{rng}")
         choice = None
+        matched_token = None
         if ti < len(tokens):
             for opt in cands:
                 if _match(tokens[ti], opt):
                     choice = opt
+                    matched_token = tokens[ti]
                     break
         if choice is None:
             choice, lc = _default_option(cands)        # ★ 修正:fv=0 优先
             low_conf = low_conf or lc
+            waiting_token = tokens[ti] if ti < len(tokens) else None
+            if waiting_token:
+                low_conf = True
+            if lc:
+                reason = "decision-default:min-formula-value(low-confidence)"
+            elif choice.formula_value == 0.0:
+                reason = "decision-default:formula-value-zero"
+            else:
+                reason = "decision-default:no-option"
+            if waiting_token:
+                reason += f";unmatched-token={waiting_token}"
         else:
             ti += 1
+            reason = f"decision-token={matched_token}"
         values[var] = choice.formula_value
+        trace.append((f"V{var}", choice.description, reason))
         var, rng = choice.next_variable, choice.next_range or 1
+    if ti < len(tokens):
+        unused = tokens[ti:]
+        low_conf = True
+        trace.append(("UNUSED_TOKEN", ",".join(unused), "decision contains unused token(s)"))
+    return values, low_conf, trace
+
+
+def decode(chart: MostChart, decision: str) -> tuple:
+    """返回 (values: dict[int,float], low_conf: bool)。"""
+    values, low_conf, _ = _decode(chart, decision)
     return values, low_conf
+
+
+def decode_with_trace(chart: MostChart, decision: str) -> tuple:
+    """返回 (values, low_conf, trace)，供快速路径输出逐变量审计轨迹。"""
+    return _decode(chart, decision)

@@ -10,7 +10,7 @@ from stds.data.cache import AutoCache
 from stds.data.charts_loader import load_charts
 from stds.data.common_chart import load_common_chart, match_common_chart
 from stds.domain.models import Source, StdsElement, StdsResult
-from stds.engine.decision_codec import decode
+from stds.engine.decision_codec import decode, decode_with_trace
 from stds.llm.prompts import load_prompt
 
 
@@ -28,6 +28,22 @@ def test_l2_exact_numeric_match():
     charts = load_charts()
     v, _ = decode(charts["202 010"], "T,90,NB")
     assert v[2] == 0.012
+
+
+def test_decode_with_trace_keeps_each_variable_choice():
+    charts = load_charts()
+    values, low_conf, trace = decode_with_trace(charts["202 010"], "T,90,NB")
+    assert values
+    assert low_conf is False
+    assert trace
+    assert all(len(step) == 3 and step[0].startswith("V") for step in trace)
+
+
+def test_decode_marks_unmatched_token_low_confidence():
+    charts = load_charts()
+    _, low_conf, trace = decode_with_trace(charts["050 03B"], "BOGUS_TOKEN")
+    assert low_conf is True
+    assert any("unmatched-token" in step[2] for step in trace)
 
 
 # ---------- #2 common_chart ----------
@@ -54,6 +70,7 @@ def test_resolver_common_chart_fast_path():
     el = StdsElement(1, "转身90度", "L", "S", freq=1.0, norm_key="转身90度")
     res = asyncio.run(resolve(el, deps))
     assert res.source == Source.CACHE and res.chartcode == "202 010"
+    assert any(step[0].startswith("V") for step in res.trace)
 
 
 # ---------- #3 T1 seed from common_chart ----------
