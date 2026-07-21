@@ -35,4 +35,10 @@ def test_decode_t_not_misplaced_to_ntt():
 
 
 def test_encode_roundtrip():
-    assert encode(["T,", "90,", "NB"]) == "T,90,NB,"
+    assert encode(["T,", "90,", "NB"]) == "T,90,NB"
+
+
+def test_encode_keeps_one_trailing_comma_only_for_empty_last_decision():
+    assert encode(["LS,", ""]) == "LS,"
+    assert encode(["LS,", "", ""]) == "LS,"
+    assert encode(["PSF,", "", "E,"]) == "PSF,,E"

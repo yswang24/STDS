@@ -1,4 +1,4 @@
-"""Excel 上传、逐行解析和原工作簿回写。"""
+"""三列中文固定模板 Excel 上传、拆解和九列明细输出。"""
 from __future__ import annotations
 
 import asyncio
@@ -7,13 +7,13 @@ from io import BytesIO
 
 import pytest
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
-from openpyxl.worksheet.table import Table
 
 from stds.domain.models import Source, StdsResult
 from stds.pipeline.excel_batch import (
     DECISION_HEADER,
-    RESULT_HEADERS,
+    INPUT_HEADERS,
+    INPUT_SHEET_NAME,
+    OUTPUT_HEADERS,
     TIME_HEADER,
     TRACE_HEADER,
     ExcelInputError,
@@ -31,50 +31,30 @@ async def _analyze_excel_bytes(*args, **kwargs):
     return await analyze_excel_bytes(*args, **kwargs)
 
 
-def _workbook_bytes(*, include_results: bool = False) -> bytes:
+def _workbook_bytes(rows: list[list] | None = None) -> bytes:
     wb = Workbook()
     ws = wb.active
-    ws.title = "数据表"
-    ws["A1"] = "原工作簿说明"
-    headers = ["number", "station_op", " Operation "]
-    if include_results:
-        headers.extend([DECISION_HEADER, TRACE_HEADER, TIME_HEADER])
-    for col, header in enumerate(headers, start=1):
-        cell = ws.cell(2, col, header)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="1F4E78")
-
-    rows = [
-        [10, "OP010", "重复操作"],
-        [None, None, None],
-        [20, "OP020", "重复操作"],
-        [30, "OP030", "失败操作"],
-    ]
-    for row_index, values in enumerate(rows, start=3):
-        for col, value in enumerate(values, start=1):
-            ws.cell(row_index, col, value)
-        ws.cell(row_index, 3).alignment = Alignment(vertical="center")
-
-    notes = wb.create_sheet("说明")
-    notes["A1"] = "这个工作表没有 operation，必须原样保留"
-
+    ws.title = INPUT_SHEET_NAME
+    ws.append(list(INPUT_HEADERS))
+    for row in rows or [[1, "OP010", "人工拿取零件"]]:
+        ws.append(row)
     output = BytesIO()
     wb.save(output)
     return output.getvalue()
 
 
-def _result(element) -> StdsResult:
+def _result(element, *, decision: str = "T,90,NB") -> StdsResult:
     return StdsResult(
         element=element,
-        chartcode="060 010",
-        decision="LS,",
+        chartcode="202 010",
+        decision=decision,
         time_s=1.2,
         cv="V",
         freq=1.0,
         source=Source.FORMULA,
         confidence=0.9,
         needs_review=False,
-        trace=[("V1", "Laser Scan", "single-candidate")],
+        trace=[("V1", "Turn", "operation-match")],
     )
 
 
@@ -92,278 +72,115 @@ def test_serialize_trace_truncation_stays_valid_json():
     assert parsed[-1]["变量"] == "TRUNCATED"
 
 
-def test_analyze_excel_preserves_rows_and_appends_three_columns():
-    cached_result = None
-    resolver_calls = 0
-    progress = []
-
-    async def fake_resolver(element, deps):
-        nonlocal cached_result, resolver_calls
-        resolver_calls += 1
-        if element.operation_des == "失败操作":
-            raise RuntimeError("mock failure")
-        if cached_result is None:
-            cached_result = _result(element)
-        return cached_result  # 模拟 AutoCache 对重复 operation 返回首条 result 对象
-
-    batch = asyncio.run(
-        _analyze_excel_bytes(
-            _workbook_bytes(),
-            "示例.xlsx",
-            object(),
-            resolver=fake_resolver,
-            concurrency=2,
-            on_progress=progress.append,
-        )
-    )
-
-    assert batch.output_filename == "示例_解析结果.xlsx"
-    assert batch.processed_count == 2
-    assert batch.failed_count == 1
-    assert batch.review_count == 0
-    assert resolver_calls == 2  # 重复 operation 只解析一次，另一次是失败 operation
-    assert progress[-1].completed_rows == 3
-    assert progress[-1].total_rows == 3
-    assert all(item.affected_rows == 1 for item in progress)
-    for phase in {item.phase for item in progress}:
-        completed = [item.completed_rows for item in progress if item.phase == phase]
-        assert completed == list(range(1, len(completed) + 1))
-    assert all(item.item_elapsed_s >= 0 for item in progress)
-    assert all(item.total_elapsed_s >= item.item_elapsed_s for item in progress)
-    assert batch.total_count == 3
-    assert batch.total_elapsed_s >= progress[-1].total_elapsed_s
-    assert batch.average_elapsed_s == pytest.approx(batch.total_elapsed_s / 3)
-    assert len(batch.timing_rows()) == 6
-
-    wb = load_workbook(BytesIO(batch.output_bytes), data_only=False)
-    ws = wb["数据表"]
-    assert ws["A1"].value == "原工作簿说明"
-    assert wb["说明"]["A1"].value == "这个工作表没有 operation，必须原样保留"
-    assert [ws.cell(2, col).value for col in range(4, 7)] == [
-        DECISION_HEADER,
-        TRACE_HEADER,
-        TIME_HEADER,
-    ]
-    assert ws["D3"].value == "LS,"
-    assert ws["D5"].value == "LS,"  # 重复输入仍按原 Excel 行回写
-    assert any(item["变量"].endswith("V1") for item in json.loads(ws["E3"].value))
-    assert ws["F3"].value == 1.2
-    assert ws["D4"].value is None  # 空 operation 行不处理
-    assert any(item["变量"].endswith("ERROR") for item in json.loads(ws["E6"].value))
-    assert "mock failure" in ws["E6"].value
-    assert ws["F6"].value is None
-    assert ws["D2"].font.bold is True
-    assert ws["D2"].fill.fgColor.rgb == ws["C2"].fill.fgColor.rgb
-    assert ws["E3"].alignment.wrap_text is True
-    assert ws["F3"].number_format == "0.00"
-    assert "STDS_拆解明细" in wb.sheetnames
-    assert wb["STDS_拆解明细"].max_row == 4
-
-
-def test_existing_result_headers_are_reused_not_duplicated():
-    async def fake_resolver(element, deps):
-        return _result(element)
-
-    batch = asyncio.run(
-        _analyze_excel_bytes(
-            _workbook_bytes(include_results=True),
-            "已有结果.xlsx",
-            object(),
-            resolver=fake_resolver,
-        )
-    )
-    ws = load_workbook(BytesIO(batch.output_bytes))["数据表"]
-    headers = [ws.cell(2, col).value for col in range(1, ws.max_column + 1)]
-    assert headers.count(DECISION_HEADER) == 1
-    assert headers.count(TRACE_HEADER) == 1
-    assert headers.count(TIME_HEADER) == 1
-    assert ws.max_column == 6
-
-
-def test_unresolved_is_marked_for_review_and_has_explanatory_trace():
-    async def unresolved_resolver(element, deps):
-        return StdsResult.unresolved(element, None)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.append(["operation"])
-    ws.append(["无法识别的动作"])
-    payload = BytesIO()
-    wb.save(payload)
-
-    batch = asyncio.run(
-        _analyze_excel_bytes(
-            payload.getvalue(),
-            "待复核.xlsx",
-            object(),
-            resolver=unresolved_resolver,
-        )
-    )
-    preview = batch.preview_rows()[0]
-    assert batch.review_count == 1
-    assert batch.failed_count == 0
-    assert preview["状态"] == "待复核"
-    assert any(
-        item["变量"].endswith("UNRESOLVED")
-        for item in json.loads(preview[TRACE_HEADER])
-    )
-    assert preview[TIME_HEADER] is None
-    result_ws = load_workbook(BytesIO(batch.output_bytes))["Sheet"]
-    assert result_ws["D2"].value is None
-
-
-def test_unrelated_time_column_is_preserved_and_result_group_is_appended():
-    async def fake_resolver(element, deps):
-        return _result(element)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.append(["operation", TIME_HEADER])
-    ws.append(["人工操作", 99])
-    payload = BytesIO()
-    wb.save(payload)
-
-    batch = asyncio.run(
-        _analyze_excel_bytes(payload.getvalue(), "原时间.xlsx", object(), resolver=fake_resolver)
-    )
-    result_ws = load_workbook(BytesIO(batch.output_bytes))["Sheet"]
-    assert result_ws["B2"].value == 99
-    assert [result_ws.cell(1, col).value for col in range(3, 6)] == list(RESULT_HEADERS)
-    assert result_ws["E2"].value == 1.2
-
-
-def test_operation_formula_without_cached_value_is_rejected():
-    wb = Workbook()
-    ws = wb.active
-    ws.append(["operation", "part"])
-    ws.append(["=B2", "拿取泡棉"])
-    payload = BytesIO()
-    wb.save(payload)
-
-    with pytest.raises(ExcelInputError, match="没有已计算值"):
-        asyncio.run(_analyze_excel_bytes(payload.getvalue(), "公式.xlsx", object()))
-
-
-def test_excel_table_is_extended_to_include_result_columns():
-    async def fake_resolver(element, deps):
-        return _result(element)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.append(["number", "station_op", "operation"])
-    ws.append([1, "OP010", "人工操作一"])
-    ws.append([2, "OP010", "人工操作二"])
-    ws.add_table(Table(displayName="OperationsTable", ref="A1:C3"))
-    payload = BytesIO()
-    wb.save(payload)
-
-    batch = asyncio.run(
-        _analyze_excel_bytes(payload.getvalue(), "表格.xlsx", object(), resolver=fake_resolver)
-    )
-    result_ws = load_workbook(BytesIO(batch.output_bytes))["Sheet"]
-    table = result_ws.tables["OperationsTable"]
-    assert table.ref == "A1:F3"
-    assert [column.name for column in table.tableColumns] == [
-        "number",
-        "station_op",
-        "operation",
-        *RESULT_HEADERS,
-    ]
-
-
-def test_excel_table_totals_row_is_not_analyzed_or_overwritten():
-    seen = []
-
-    async def fake_resolver(element, deps):
-        seen.append(element.operation_des)
-        return _result(element)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.append(["operation", "数量"])
-    ws.append(["人工动作", 1])
-    ws.append(["总计", 1])
-    table = Table(
-        displayName="OperationsWithTotal",
-        ref="A1:B3",
-        totalsRowCount=1,
-        totalsRowShown=True,
-    )
-    ws.add_table(table)
-    payload = BytesIO()
-    wb.save(payload)
-
-    batch = asyncio.run(
-        _analyze_excel_bytes(payload.getvalue(), "合计行.xlsx", object(), resolver=fake_resolver)
-    )
-    result_ws = load_workbook(BytesIO(batch.output_bytes))["Sheet"]
-    assert seen == ["人工动作"]
-    assert batch.processed_count == 1
-    assert result_ws["C3"].value is None
-    assert result_ws.tables["OperationsWithTotal"].ref == "A1:E3"
-
-
-def test_manual_operation_is_expanded_and_each_child_is_analyzed():
-    wb = Workbook()
-    ws = wb.active
-    ws.append(["number", "station_op", "operation"])
-    ws.append([7, "OP070", "操作人员安装零件"])
-    payload = BytesIO()
-    wb.save(payload)
-
+def test_fixed_template_is_flattened_to_exact_nine_columns():
     child_operations = [
-        "操作人员转身",
-        "操作人员拿取零件",
-        "操作人员安装零件",
+        "操作人员拿取吊具",
+        "操作人员移动吊具",
+        "操作人员使用吊具抓取中心支撑壳体",
+        "操作人员移动吊具",
+        "操作人员操作吊具释放中心支撑壳体",
     ]
-    resolver_calls = []
 
     async def fake_decomposer(operation):
-        assert operation == "操作人员安装零件"
+        assert operation == "操作人员用吊具转运中心支撑壳体"
         return child_operations
 
     async def fake_resolver(element, deps, *, machine_hint=None):
-        resolver_calls.append((element.operation_des, machine_hint))
+        assert machine_hint is False
         return _result(element)
 
     batch = asyncio.run(
         analyze_excel_bytes(
-            payload.getvalue(),
-            "拆解.xlsx",
+            _workbook_bytes(
+                [[2, "OP010", "操作人员用吊具转运中心支撑壳体"]]
+            ),
+            "1.STDS-PF清单 副本.xlsx",
             object(),
             resolver=fake_resolver,
             decomposer=fake_decomposer,
         )
     )
 
-    assert batch.total_count == 1
-    assert batch.detail_count == 3
-    assert [row["拆解序号"] for row in batch.decomposition_rows()] == ["1/3", "2/3", "3/3"]
-    assert [row["拆解后operation"] for row in batch.decomposition_rows()] == child_operations
-    assert resolver_calls == [(operation, False) for operation in child_operations]
-    assert batch.preview_rows()[0][TIME_HEADER] == 3.6
-    assert {timing.phase for timing in batch.timings} == {"拆解", "工时分析"}
-    assert batch.timings[-1].overall_ratio == 1.0
+    wb = load_workbook(BytesIO(batch.output_bytes), data_only=False)
+    ws = wb[INPUT_SHEET_NAME]
+    assert tuple(ws.cell(1, col).value for col in range(1, 10)) == OUTPUT_HEADERS
+    assert ws.max_column == 9
+    assert ws.max_row == 6
+    assert [ws.cell(row, 1).value for row in range(2, 7)] == [2] * 5
+    assert [ws.cell(row, 2).value for row in range(2, 7)] == ["OP010"] * 5
+    assert [ws.cell(row, 3).value for row in range(2, 7)] == child_operations
+    assert [ws.cell(row, 4).value for row in range(2, 7)] == ["T,90,NB"] * 5
+    assert [ws.cell(row, 5).value for row in range(2, 7)] == ["202 010"] * 5
+    assert [ws.cell(row, 6).value for row in range(2, 7)] == ["V"] * 5
+    assert [ws.cell(row, 7).value for row in range(2, 7)] == [1.0] * 5
+    assert [ws.cell(row, 8).value for row in range(2, 7)] == [1.2] * 5
+    assert all(json.loads(ws.cell(row, 9).value) for row in range(2, 7))
+    assert ws.freeze_panes == "A2"
+    assert ws.auto_filter.ref == "A1:I6"
+    assert batch.output_filename == "1.STDS-PF清单 副本_解析结果.xlsx"
+    assert batch.detail_sheet_name == INPUT_SHEET_NAME
 
-    result_wb = load_workbook(BytesIO(batch.output_bytes))
-    result_ws = result_wb["Sheet"]
-    decisions = json.loads(result_ws["D2"].value)
-    assert [item["拆解序号"] for item in decisions] == ["1/3", "2/3", "3/3"]
-    assert result_ws["F2"].value == 3.6
-    detail_ws = result_wb[batch.detail_sheet_name]
-    assert detail_ws.max_row == 4
-    assert [detail_ws.cell(row, 7).value for row in range(2, 5)] == [1, 2, 3]
-    assert [detail_ws.cell(row, 9).value for row in range(2, 5)] == child_operations
+
+def test_duplicate_operations_are_analyzed_once_but_each_source_row_is_output():
+    resolver_calls = 0
+    progress = []
+
+    async def fake_resolver(element, deps, *, machine_hint=None):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return _result(element)
+
+    batch = asyncio.run(
+        _analyze_excel_bytes(
+            _workbook_bytes(
+                [
+                    [10, "OP010", "重复操作"],
+                    [20, "OP020", "重复操作"],
+                ]
+            ),
+            "重复.xlsx",
+            object(),
+            resolver=fake_resolver,
+            on_progress=progress.append,
+        )
+    )
+
+    assert resolver_calls == 1
+    assert batch.total_count == 2
+    assert batch.detail_count == 2
+    assert len(batch.timing_rows()) == 4
+    assert all(item.item_elapsed_s >= 0 for item in progress)
+    assert progress[-1].overall_ratio == 1.0
+    ws = load_workbook(BytesIO(batch.output_bytes))[INPUT_SHEET_NAME]
+    assert [ws.cell(row, 1).value for row in (2, 3)] == [10, 20]
+    assert [ws.cell(row, 2).value for row in (2, 3)] == ["OP010", "OP020"]
 
 
-def test_machine_operation_is_not_decomposed_and_reuses_actor_hint():
-    wb = Workbook()
-    ws = wb.active
-    ws.append(["operation"])
-    ws.append(["设备自动托盘进入"])
-    payload = BytesIO()
-    wb.save(payload)
+def test_unresolved_row_has_empty_result_fields_and_explanatory_trace():
+    async def unresolved_resolver(element, deps, *, machine_hint=None):
+        return StdsResult.unresolved(element, None)
 
+    batch = asyncio.run(
+        _analyze_excel_bytes(
+            _workbook_bytes([[3, "OP030", "无法识别的动作"]]),
+            "待复核.xlsx",
+            object(),
+            resolver=unresolved_resolver,
+        )
+    )
+
+    assert batch.review_count == 1
+    ws = load_workbook(BytesIO(batch.output_bytes))[INPUT_SHEET_NAME]
+    assert ws.cell(2, 4).value is None
+    assert ws.cell(2, 5).value is None
+    assert ws.cell(2, 8).value is None
+    assert any(
+        item["变量"].endswith("UNRESOLVED")
+        for item in json.loads(ws.cell(2, 9).value)
+    )
+
+
+def test_machine_operation_is_not_decomposed_and_outputs_zero_time():
     decomposer_calls = 0
     hints = []
 
@@ -378,7 +195,7 @@ def test_machine_operation_is_not_decomposed_and_reuses_actor_hint():
 
     batch = asyncio.run(
         analyze_excel_bytes(
-            payload.getvalue(),
+            _workbook_bytes([[1, "OP010", "设备自动托盘进入"]]),
             "设备.xlsx",
             object(),
             resolver=fake_resolver,
@@ -388,9 +205,76 @@ def test_machine_operation_is_not_decomposed_and_reuses_actor_hint():
 
     assert decomposer_calls == 0
     assert hints == [True]
-    assert batch.detail_count == 1
-    assert batch.decomposition_rows()[0]["主体类型"] == "设备"
-    assert batch.preview_rows()[0][TIME_HEADER] == 0.0
+    ws = load_workbook(BytesIO(batch.output_bytes))[INPUT_SHEET_NAME]
+    assert ws.cell(2, 3).value == "设备自动托盘进入"
+    assert ws.cell(2, 6).value == "V"
+    assert ws.cell(2, 7).value == 1.0
+    assert ws.cell(2, 8).value == 0.0
+
+
+@pytest.mark.parametrize(
+    ("headers", "message"),
+    [
+        (["number", "station_op", "operation"], "必须依次为"),
+        (["序号", "工位号", " 操作内容 "], "必须依次为"),
+    ],
+)
+def test_header_aliases_or_whitespace_are_not_mapped(headers, message):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = INPUT_SHEET_NAME
+    ws.append(headers)
+    ws.append([1, "OP010", "人工拿取零件"])
+    payload = BytesIO()
+    wb.save(payload)
+
+    with pytest.raises(ExcelInputError, match=message):
+        asyncio.run(_analyze_excel_bytes(payload.getvalue(), "错误模板.xlsx", object()))
+
+
+def test_fourth_input_column_is_rejected():
+    wb = Workbook()
+    ws = wb.active
+    ws.title = INPUT_SHEET_NAME
+    ws.append([*INPUT_HEADERS, "父记录"])
+    ws.append([1, "OP010", "人工拿取零件", None])
+    payload = BytesIO()
+    wb.save(payload)
+
+    with pytest.raises(ExcelInputError, match="只允许三列"):
+        asyncio.run(_analyze_excel_bytes(payload.getvalue(), "四列模板.xlsx", object()))
+
+
+def test_missing_number_or_station_is_rejected():
+    with pytest.raises(ExcelInputError, match="序号不能为空"):
+        asyncio.run(
+            _analyze_excel_bytes(
+                _workbook_bytes([[None, "OP010", "人工拿取零件"]]),
+                "缺序号.xlsx",
+                object(),
+            )
+        )
+    with pytest.raises(ExcelInputError, match="工位号不能为空"):
+        asyncio.run(
+            _analyze_excel_bytes(
+                _workbook_bytes([[1, None, "人工拿取零件"]]),
+                "缺工位.xlsx",
+                object(),
+            )
+        )
+
+
+def test_operation_formula_without_cached_value_is_rejected():
+    wb = Workbook()
+    ws = wb.active
+    ws.title = INPUT_SHEET_NAME
+    ws.append(list(INPUT_HEADERS))
+    ws.append([1, "OP010", "=A2"])
+    payload = BytesIO()
+    wb.save(payload)
+
+    with pytest.raises(ExcelInputError, match="没有已计算值"):
+        asyncio.run(_analyze_excel_bytes(payload.getvalue(), "公式.xlsx", object()))
 
 
 @pytest.mark.parametrize("payload", [b"", b"not-an-xlsx"])

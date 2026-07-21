@@ -18,7 +18,16 @@ from stds.engine.formula import EngineError
 
 
 def encode(abbrevs: list) -> str:
-    return ",".join((a or "").rstrip(",") for a in abbrevs) + ","
+    """按决策顺序编码，尾逗号只用于表示最后一个决策为空。
+
+    历史实现会无条件追加逗号，导致最后一个决策非空时也产生尾逗号；
+    若末项本身为空还会得到两个尾逗号。这里保留中间空决策，但把连续的
+    末尾空决策收敛为一个，保证结果最多只有一个尾逗号。
+    """
+    cleaned = [(abbrev or "").rstrip(",") for abbrev in abbrevs]
+    while len(cleaned) >= 2 and cleaned[-1] == "" and cleaned[-2] == "":
+        cleaned.pop()
+    return ",".join(cleaned)
 
 
 def _match(token: str, opt: ValueOption) -> bool:

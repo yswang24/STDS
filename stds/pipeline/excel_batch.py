@@ -1,4 +1,4 @@
-"""Excel 批量输入/输出：读取 operation，逐行解析并回写审计结果。"""
+"""固定模板 Excel 批量输入/输出：拆解 operation 后逐行输出工时结果。"""
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +6,6 @@ import inspect
 import json
 import logging
 import time
-from copy import copy
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
@@ -15,9 +14,6 @@ from typing import Callable, Optional
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from openpyxl.utils.cell import range_boundaries
-from openpyxl.worksheet.table import TableColumn
-from openpyxl.worksheet.worksheet import Worksheet
 
 from stds.cascade.resolver import Deps, resolve
 from stds.cascade.rules import normalize
@@ -34,14 +30,30 @@ from stds.pipeline.operation_analysis import (
 
 logger = logging.getLogger("stds.excel_batch")
 
-OPERATION_HEADER = "operation"
-DECISION_HEADER = "决策串"
+INPUT_SHEET_NAME = "数据表"
+NUMBER_HEADER = "序号"
+STATION_HEADER = "工位号"
+OUTPUT_OPERATION_HEADER = "操作内容"
+INPUT_HEADERS = (NUMBER_HEADER, STATION_HEADER, OUTPUT_OPERATION_HEADER)
+DECISION_HEADER = "决策描述"
+CHARTCODE_HEADER = "动作代码"
+CV_HEADER = "增值/非增值(C/V)"
+FREQ_HEADER = "频率"
 TRACE_HEADER = "逐步的决策选择（trace）"
 TIME_HEADER = "时间"
-RESULT_HEADERS = (DECISION_HEADER, TRACE_HEADER, TIME_HEADER)
+OUTPUT_HEADERS = (
+    NUMBER_HEADER,
+    STATION_HEADER,
+    OUTPUT_OPERATION_HEADER,
+    DECISION_HEADER,
+    CHARTCODE_HEADER,
+    CV_HEADER,
+    FREQ_HEADER,
+    TIME_HEADER,
+    TRACE_HEADER,
+)
 EXCEL_CELL_TEXT_LIMIT = 32767
 TRACE_FIELD_LIMIT = 8000
-DETAIL_SHEET_BASE = "STDS_拆解明细"
 PHASE_DECOMPOSE = "拆解"
 PHASE_ANALYZE = "工时分析"
 
@@ -101,12 +113,28 @@ class ExcelDetailResult:
     def as_preview(self) -> dict:
         return {
             **self.as_decomposition_preview(),
-            "Chartcode": self.result.chartcode if self.result else "",
+            CHARTCODE_HEADER: self.result.chartcode if self.result else "",
             DECISION_HEADER: self.result.decision if self.result else "",
+            CV_HEADER: self.result.cv if self.result else "",
+            FREQ_HEADER: self.result.freq if self.result else None,
             TRACE_HEADER: _detail_trace(self),
             TIME_HEADER: self.time_value(),
             "状态": self.status,
         }
+
+    def output_values(self) -> list:
+        """返回固定九列输出；拆解子动作沿用原始序号和工位号。"""
+        return [
+            self.input_row.number,
+            self.input_row.station_op,
+            self.operation,
+            self.result.decision if self.result else "",
+            self.result.chartcode if self.result else "",
+            self.result.cv if self.result else "",
+            self.result.freq if self.result else None,
+            self.time_value(),
+            _detail_trace(self),
+        ]
 
     def time_value(self) -> Optional[float]:
         if self.split.needs_review or self.result is None:
@@ -271,184 +299,11 @@ class ExcelProgress:
         }
 
 
-@dataclass(frozen=True)
-class _SheetLayout:
-    sheet_name: str
-    header_row: int
-    operation_col: int
-    result_cols: dict[str, int]
-    totals_row: Optional[int] = None
-
-
 ProgressCallback = Callable[[ExcelProgress], object]
 
 
-def _header_key(value: object) -> str:
-    if value is None:
-        return ""
-    return "".join(str(value).strip().casefold().split())
-
-
-def _find_header(ws: Worksheet) -> Optional[tuple[int, int]]:
-    """在前 100 行寻找大小写/空白不敏感的 operation 表头。"""
-    max_scan_row = min(ws.max_row, 100)
-    for row in ws.iter_rows(min_row=1, max_row=max_scan_row):
-        for cell in row:
-            if _header_key(cell.value) == OPERATION_HEADER:
-                return cell.row, cell.column
-    return None
-
-
-def _header_map(ws: Worksheet, header_row: int) -> dict[str, int]:
-    return {
-        _header_key(cell.value): cell.column
-        for cell in ws[header_row]
-        if _header_key(cell.value)
-    }
-
-
-def _coerce_number(value: object, fallback: int) -> int:
-    if isinstance(value, bool):
-        return fallback
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return fallback
-
-
-def _copy_style(source, target) -> None:
-    if source.has_style:
-        target.font = copy(source.font)
-        target.fill = copy(source.fill)
-        target.border = copy(source.border)
-        target.alignment = copy(source.alignment)
-        target.number_format = source.number_format
-        target.protection = copy(source.protection)
-
-
-def _find_operation_table(ws: Worksheet, header_row: int, operation_col: int):
-    for table in ws.tables.values():
-        min_col, min_row, max_col, max_row = range_boundaries(table.ref)
-        if min_row == header_row and min_col <= operation_col <= max_col:
-            return table, (min_col, min_row, max_col, max_row)
-    return None, None
-
-
-def _columns_are_blank(
-    ws: Worksheet,
-    start_col: int,
-    end_col: int,
-    start_row: int,
-    end_row: int,
-) -> bool:
-    return all(
-        ws.cell(row, col).value in (None, "")
-        for row in range(start_row, end_row + 1)
-        for col in range(start_col, end_col + 1)
-    )
-
-
-def _extend_table_to_results(ws: Worksheet, table, bounds, result_cols: dict[str, int]) -> None:
-    min_col, min_row, max_col, max_row = bounds
-    ordered_cols = [result_cols[header] for header in RESULT_HEADERS]
-    if ordered_cols[-1] <= max_col:
-        return
-    if ordered_cols != list(range(max_col + 1, max_col + 1 + len(RESULT_HEADERS))):
-        raise ExcelInputError(
-            f"工作表“{ws.title}”的 operation 位于 Excel Table 中，"
-            "但结果三列无法连续追加到该 Table 右侧"
-        )
-
-    new_max_col = ordered_cols[-1]
-    expected_width = new_max_col - min_col + 1
-    next_column_id = max((column.id for column in table.tableColumns), default=0) + 1
-    while len(table.tableColumns) < expected_width:
-        position = len(table.tableColumns) + 1
-        header_value = ws.cell(min_row, min_col + position - 1).value
-        table.tableColumns.append(
-            TableColumn(id=next_column_id, name=str(header_value or "Column"))
-        )
-        next_column_id += 1
-
-    table.ref = (
-        f"{get_column_letter(min_col)}{min_row}:"
-        f"{get_column_letter(new_max_col)}{max_row}"
-    )
-    if table.autoFilter is not None:
-        table.autoFilter.ref = table.ref
-
-
-def _prepare_sheet(ws: Worksheet, header_row: int, operation_col: int) -> _SheetLayout:
-    headers = _header_map(ws, header_row)
-    header_values = [_header_key(cell.value) for cell in ws[header_row]]
-    result_keys = tuple(_header_key(header) for header in RESULT_HEADERS)
-    existing_start = next(
-        (
-            index + 1
-            for index in range(max(0, len(header_values) - len(result_keys) + 1))
-            if tuple(header_values[index:index + len(result_keys)]) == result_keys
-        ),
-        None,
-    )
-    source_header = ws.cell(header_row, operation_col)
-    operation_table, table_bounds = _find_operation_table(ws, header_row, operation_col)
-    totals_row = None
-    if operation_table is not None and (
-        operation_table.totalsRowCount or operation_table.totalsRowShown
-    ):
-        totals_row = table_bounds[3]
-    if existing_start is not None:
-        result_cols = {
-            header: existing_start + offset
-            for offset, header in enumerate(RESULT_HEADERS)
-        }
-        # 幂等重跑：只清理由本工具识别出的完整三列，避免空 operation 残留旧结果。
-        for row_index in range(header_row + 1, ws.max_row + 1):
-            if row_index == totals_row:
-                continue
-            for col in result_cols.values():
-                ws.cell(row_index, col).value = None
-    else:
-        if table_bounds is not None:
-            _, _, table_max_col, table_max_row = table_bounds
-            next_col = table_max_col + 1
-            if not _columns_are_blank(
-                ws,
-                next_col,
-                next_col + len(RESULT_HEADERS) - 1,
-                header_row,
-                max(ws.max_row, table_max_row),
-            ):
-                raise ExcelInputError(
-                    f"工作表“{ws.title}”的 operation 位于 Excel Table 中；"
-                    "请先确保该 Table 右侧三列为空，再上传解析"
-                )
-        else:
-            next_col = max(ws.max_column, max(headers.values(), default=0)) + 1
-        result_cols = {}
-        for header in RESULT_HEADERS:
-            col = next_col
-            next_col += 1
-            target = ws.cell(header_row, col, header)
-            _copy_style(source_header, target)
-            result_cols[header] = col
-
-    if operation_table is not None:
-        _extend_table_to_results(ws, operation_table, table_bounds, result_cols)
-
-    widths = {DECISION_HEADER: 30, TRACE_HEADER: 80, TIME_HEADER: 12}
-    operation_letter = get_column_letter(operation_col)
-    operation_width = ws.column_dimensions[operation_letter].width or 0
-    ws.column_dimensions[operation_letter].width = max(operation_width, 45)
-    for header, col in result_cols.items():
-        letter = get_column_letter(col)
-        current = ws.column_dimensions[letter].width or 0
-        ws.column_dimensions[letter].width = max(current, widths[header])
-
-    return _SheetLayout(ws.title, header_row, operation_col, result_cols, totals_row)
-
-
 def _load_inputs(excel_bytes: bytes):
+    """按固定模板读取 数据表!A:C，不做表头搜索、别名或字段映射。"""
     if not excel_bytes:
         raise ExcelInputError("上传的 Excel 文件为空")
     try:
@@ -457,67 +312,69 @@ def _load_inputs(excel_bytes: bytes):
     except Exception as exc:
         raise ExcelInputError("无法读取该文件，请确认它是有效的 .xlsx 工作簿") from exc
 
-    layouts: dict[str, _SheetLayout] = {}
+    if INPUT_SHEET_NAME not in workbook.sheetnames:
+        raise ExcelInputError(f"固定模板缺少“{INPUT_SHEET_NAME}”工作表")
+
+    ws = workbook[INPUT_SHEET_NAME]
+    values_ws = values_workbook[INPUT_SHEET_NAME]
+    actual_headers = tuple(ws.cell(1, col).value for col in range(1, 4))
+    if actual_headers != INPUT_HEADERS:
+        raise ExcelInputError(
+            "数据表第 1 行必须依次为：" + "、".join(INPUT_HEADERS)
+        )
+    extra_headers = [
+        ws.cell(1, col).value
+        for col in range(4, ws.max_column + 1)
+        if ws.cell(1, col).value not in (None, "")
+    ]
+    if extra_headers:
+        raise ExcelInputError("数据表输入只允许三列：" + "、".join(INPUT_HEADERS))
+
     input_rows: list[ExcelInputRow] = []
-    sequence = 0
     has_formula_operations = False
 
-    for ws in workbook.worksheets:
-        found = _find_header(ws)
-        if found is None:
-            continue
-        header_row, operation_col = found
-        layout = _prepare_sheet(ws, header_row, operation_col)
-        layouts[ws.title] = layout
-        values_ws = values_workbook[ws.title]
-        headers = _header_map(ws, header_row)
-        number_col = headers.get("number")
-        station_col = headers.get("station_op")
-        line_col = headers.get("line_name")
-
-        for row_index in range(header_row + 1, ws.max_row + 1):
-            if row_index == layout.totals_row:
-                continue
-            operation_cell = ws.cell(row_index, operation_col)
-            if operation_cell.data_type == "f":
-                has_formula_operations = True
-                raw_operation = values_ws.cell(row_index, operation_col).value
-                if raw_operation is None:
-                    raise ExcelInputError(
-                        f"工作表“{ws.title}”第 {row_index} 行的 operation 是公式，"
-                        "但文件中没有已计算值；请先在 Excel 中重新计算并保存"
-                    )
-            else:
-                raw_operation = operation_cell.value
-            if raw_operation is None or not str(raw_operation).strip():
-                continue
-            sequence += 1
-            operation = str(raw_operation).strip()
-            norm_key = normalize(operation) or operation
-            number_value = ws.cell(row_index, number_col).value if number_col else None
-            station_value = ws.cell(row_index, station_col).value if station_col else None
-            line_value = ws.cell(row_index, line_col).value if line_col else None
-            input_rows.append(
-                ExcelInputRow(
-                    sheet_name=ws.title,
-                    row_index=row_index,
-                    operation=operation,
-                    number=_coerce_number(number_value, sequence),
-                    line_name=str(line_value).strip() if line_value not in (None, "") else "Excel导入",
-                    station_op=str(station_value).strip() if station_value not in (None, "") else ws.title,
-                    norm_key=norm_key,
+    for row_index in range(2, ws.max_row + 1):
+        operation_cell = ws.cell(row_index, 3)
+        if operation_cell.data_type == "f":
+            has_formula_operations = True
+            raw_operation = values_ws.cell(row_index, 3).value
+            if raw_operation is None:
+                raise ExcelInputError(
+                    f"数据表第 {row_index} 行的 operation 是公式，"
+                    "但文件中没有已计算值；请先在 Excel 中重新计算并保存"
                 )
-            )
+        else:
+            raw_operation = operation_cell.value
+        if raw_operation is None or not str(raw_operation).strip():
+            continue
 
-    if not layouts:
-        raise ExcelInputError("未找到 operation 字段；请在任一工作表前 100 行提供该表头")
+        number_value = ws.cell(row_index, 1).value
+        station_value = ws.cell(row_index, 2).value
+        if number_value in (None, ""):
+            raise ExcelInputError(f"数据表第 {row_index} 行的序号不能为空")
+        if station_value in (None, ""):
+            raise ExcelInputError(f"数据表第 {row_index} 行的工位号不能为空")
+
+        operation = str(raw_operation).strip()
+        input_rows.append(
+            ExcelInputRow(
+                sheet_name=INPUT_SHEET_NAME,
+                row_index=row_index,
+                operation=operation,
+                number=number_value,
+                line_name="Excel导入",
+                station_op=str(station_value).strip(),
+                norm_key=normalize(operation) or operation,
+            )
+        )
+
     if not input_rows:
-        raise ExcelInputError("operation 字段下没有可解析的输入")
+        raise ExcelInputError("操作内容字段下没有可解析的输入")
     if has_formula_operations:
         workbook.calculation.calcMode = "auto"
         workbook.calculation.fullCalcOnLoad = True
         workbook.calculation.forceFullCalc = True
-    return workbook, layouts, input_rows
+    return workbook, input_rows
 
 
 def serialize_trace(trace: list) -> str:
@@ -612,125 +469,52 @@ def _result_time(result: StdsResult) -> Optional[float]:
     return result.time_s
 
 
-def _unique_sheet_title(workbook, base: str) -> str:
-    if base not in workbook.sheetnames:
-        return base
-    index = 2
-    while f"{base}_{index}" in workbook.sheetnames:
-        index += 1
-    return f"{base}_{index}"
+def _write_results(workbook, rows: list[ExcelRowResult]) -> tuple[bytes, str]:
+    """将 数据表 重写为固定九列的逐条拆解结果。"""
+    ws = workbook[INPUT_SHEET_NAME]
+    for table_name in list(ws.tables):
+        del ws.tables[table_name]
+    if ws.max_row:
+        ws.delete_rows(1, ws.max_row)
 
-
-def _write_detail_sheet(workbook, rows: list[ExcelRowResult]) -> str:
-    title = _unique_sheet_title(workbook, DETAIL_SHEET_BASE)
-    ws = workbook.create_sheet(title)
-    headers = [
-        "来源工作表",
-        "来源Excel行",
-        "number",
-        "station_op",
-        "原始operation",
-        "主体类型",
-        "拆解序号",
-        "拆解总数",
-        "拆解后operation",
-        "拆解来源",
-        "Chartcode",
-        DECISION_HEADER,
-        TRACE_HEADER,
-        TIME_HEADER,
-        "状态",
-    ]
     header_fill = PatternFill("solid", fgColor="1F4E78")
-    for col, header in enumerate(headers, start=1):
+    for col, header in enumerate(OUTPUT_HEADERS, start=1):
         cell = ws.cell(1, col, header)
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     output_row = 2
     for row in rows:
         for detail in row.details:
-            values = [
-                detail.input_row.sheet_name,
-                detail.input_row.row_index,
-                detail.input_row.number,
-                detail.input_row.station_op,
-                detail.input_row.operation,
-                detail.split.actor,
-                detail.child_index,
-                detail.child_count,
-                detail.operation,
-                detail.split.source,
-                detail.result.chartcode if detail.result else "",
-                detail.result.decision if detail.result else "",
-                _detail_trace(detail),
-                detail.time_value(),
-                detail.status,
-            ]
-            for col, value in enumerate(values, start=1):
+            for col, value in enumerate(detail.output_values(), start=1):
                 cell = ws.cell(output_row, col, value)
-                cell.alignment = Alignment(vertical="top", wrap_text=col in {5, 9, 12, 13})
-            ws.cell(output_row, headers.index(TIME_HEADER) + 1).number_format = "0.00"
+                cell.alignment = Alignment(
+                    vertical="top",
+                    wrap_text=col in {3, 4, 9},
+                )
+            ws.cell(output_row, OUTPUT_HEADERS.index(FREQ_HEADER) + 1).number_format = "0.00"
+            ws.cell(output_row, OUTPUT_HEADERS.index(TIME_HEADER) + 1).number_format = "0.00"
+            trace_length = len(str(ws.cell(output_row, 9).value or ""))
+            operation_length = len(str(ws.cell(output_row, 3).value or ""))
+            display_lines = max(
+                1,
+                (operation_length + 34) // 35,
+                (trace_length + 74) // 75,
+            )
+            ws.row_dimensions[output_row].height = min(180, display_lines * 15)
             output_row += 1
 
-    widths = [14, 12, 10, 16, 44, 12, 10, 10, 44, 14, 14, 30, 80, 12, 12]
+    widths = [10, 14, 44, 30, 14, 20, 10, 12, 80]
     for col, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(1, output_row - 1)}"
-    ws.row_dimensions[1].height = 24
-    return title
+    ws.auto_filter.ref = f"A1:I{max(1, output_row - 1)}"
+    ws.row_dimensions[1].height = 30
 
-
-def _write_results(
-    workbook,
-    layouts: dict[str, _SheetLayout],
-    rows: list[ExcelRowResult],
-) -> tuple[bytes, str]:
-    for row in rows:
-        ws = workbook[row.input_row.sheet_name]
-        layout = layouts[row.input_row.sheet_name]
-        operation_cell = ws.cell(row.input_row.row_index, layout.operation_col)
-        operation_alignment = copy(operation_cell.alignment)
-        operation_alignment.wrap_text = True
-        operation_alignment.vertical = "top"
-        operation_cell.alignment = operation_alignment
-        values = {
-            DECISION_HEADER: row.decision_value(),
-            TRACE_HEADER: row.trace_value(),
-            TIME_HEADER: row.time_value(),
-        }
-        for header, value in values.items():
-            cell = ws.cell(row.input_row.row_index, layout.result_cols[header])
-            if not cell.has_style:
-                _copy_style(operation_cell, cell)
-            cell.value = value
-            if header == TRACE_HEADER:
-                alignment = copy(cell.alignment)
-                alignment.wrap_text = True
-                alignment.vertical = "top"
-                cell.alignment = alignment
-            elif header == TIME_HEADER:
-                cell.number_format = "0.00"
-
-        trace_length = len(str(values[TRACE_HEADER] or ""))
-        operation_length = len(row.input_row.operation)
-        display_lines = max(
-            1,
-            (operation_length + 34) // 35,
-            (trace_length + 74) // 75,
-        )
-        current_height = ws.row_dimensions[row.input_row.row_index].height or 15
-        ws.row_dimensions[row.input_row.row_index].height = max(
-            current_height,
-            min(180, display_lines * 15),
-        )
-
-    detail_sheet_name = _write_detail_sheet(workbook, rows)
     output = BytesIO()
     workbook.save(output)
-    return output.getvalue(), detail_sheet_name
+    return output.getvalue(), INPUT_SHEET_NAME
 
 
 def build_output_filename(source_name: str) -> str:
@@ -751,7 +535,7 @@ async def analyze_excel_bytes(
 ) -> ExcelBatchOutput:
     """先拆解 operation，再逐个子动作计算工时并回写完整审计结果。"""
     batch_started = time.perf_counter()
-    workbook, layouts, input_rows = _load_inputs(excel_bytes)
+    workbook, input_rows = _load_inputs(excel_bytes)
     timings: list[ExcelProgress] = []
     sem = asyncio.Semaphore(max(1, concurrency or settings.CONCURRENCY_LIMIT))
 
@@ -933,7 +717,7 @@ async def analyze_excel_bytes(
         *(analyze_group(group) for group in detail_groups.values())
     )
     analysis_elapsed_s = time.perf_counter() - analysis_started
-    output_bytes, detail_sheet_name = _write_results(workbook, layouts, rows)
+    output_bytes, detail_sheet_name = _write_results(workbook, rows)
     total_elapsed_s = time.perf_counter() - batch_started
     return ExcelBatchOutput(
         output_bytes=output_bytes,
