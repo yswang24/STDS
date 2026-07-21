@@ -4,13 +4,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 
+import pytest
+
 from stds.llm.decompose import (
     DIFY_INPUT_PLACEHOLDER,
     DecomposeOut,
     build_decompose_prompt,
     decompose_operation,
 )
-from stds.llm.client import _OpenAIClient
+from stds.llm.client import LLMError, _OpenAIClient
 from stds.llm.prompts import load_prompt
 
 
@@ -50,6 +52,8 @@ def test_openai_client_sends_dify_prompt_as_the_only_system_message(monkeypatch)
     captured = {}
 
     class Response:
+        status_code = 200
+
         def json(self):
             return {
                 "choices": [
@@ -70,3 +74,111 @@ def test_openai_client_sends_dify_prompt_as_the_only_system_message(monkeypatch)
 
     assert result.operation == ["操作人员拿取零件"]
     assert captured["messages"] == [{"role": "system", "content": prompt}]
+
+
+def test_vllm_client_uses_json_schema_response_format(monkeypatch):
+    captured = {}
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": '{"operation":["操作人员安装零件"]}',
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    def fake_post(url, **kwargs):
+        captured.update(kwargs["json"])
+        return Response()
+
+    monkeypatch.setattr("stds.llm.client.httpx.post", fake_post)
+    client = _OpenAIClient(
+        "http://vllm/v1",
+        "key",
+        "qwen",
+        vllm_json_schema=True,
+    )
+    result = asyncio.run(client.structured("拆解", DecomposeOut))
+
+    assert result.operation == ["操作人员安装零件"]
+    assert captured["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "DecomposeOut",
+            "schema": DecomposeOut.model_json_schema(),
+        },
+    }
+    assert "guided_json" not in captured
+
+
+def test_vllm_client_falls_back_to_legacy_guided_json(monkeypatch):
+    payloads = []
+
+    class Response:
+        def __init__(self, status_code, data):
+            self.status_code = status_code
+            self._data = data
+
+        def json(self):
+            return self._data
+
+    def fake_post(url, **kwargs):
+        payloads.append(kwargs["json"])
+        if len(payloads) == 1:
+            return Response(
+                400,
+                {"error": {"message": "json_schema is not supported"}},
+            )
+        return Response(
+            200,
+            {
+                "choices": [
+                    {"message": {"content": '{"operation":["操作人员拿取零件"]}'}}
+                ]
+            },
+        )
+
+    monkeypatch.setattr("stds.llm.client.httpx.post", fake_post)
+    client = _OpenAIClient(
+        "http://legacy-vllm/v1",
+        "key",
+        "qwen",
+        vllm_json_schema=True,
+    )
+    result = asyncio.run(client.structured("拆解", DecomposeOut, retries=0))
+
+    assert result.operation == ["操作人员拿取零件"]
+    assert payloads[0]["response_format"]["type"] == "json_schema"
+    assert payloads[1]["guided_json"] == DecomposeOut.model_json_schema()
+    assert "response_format" not in payloads[1]
+
+
+def test_openai_error_response_reports_real_service_message(monkeypatch):
+    class Response:
+        status_code = 429
+
+        def json(self):
+            return {
+                "error": {
+                    "type": "rate_limit_error",
+                    "code": "rpm_limit",
+                    "message": "request rate exceeded",
+                }
+            }
+
+    monkeypatch.setattr("stds.llm.client.httpx.post", lambda *args, **kwargs: Response())
+    client = _OpenAIClient("http://test/v1", "key", "model")
+
+    with pytest.raises(LLMError, match=r"HTTP 429.*rpm_limit.*request rate exceeded"):
+        asyncio.run(client.structured("拆解", DecomposeOut, retries=0))

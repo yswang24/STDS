@@ -117,17 +117,20 @@ def test_pick_value_numeric():
     assert r.formula_value == 18.0 and "numeric" in reason
 
 
-def test_pick_value_llm_clamp():
+def test_pick_value_llm_clamp(monkeypatch):
     """LLM 返回越界 index 被夹取。"""
     import asyncio
-    mock = get_mock_llm()
     cands = [
         ValueOption(1, 1, 1, "A", "A,", 1.0, 2, 1),
         ValueOption(1, 1, 2, "B", "B,", 2.0, 2, 1),
     ]
-    # mock 返回 index=0(默认),不会越界;但确认夹取逻辑在 pick_value 里
+
+    async def out_of_range_index(prompt, schema):
+        return schema(index=99, reason="mock out of range")
+
+    monkeypatch.setattr("stds.llm.pick_value.structured", out_of_range_index)
     r, _, _ = asyncio.run(pick_value("未知操作", cands))
-    assert r.formula_value == 1.0  # 夹到有效范围
+    assert r.formula_value == 2.0  # 99 被夹到最后一个有效下标
 
 
 # ---------- Step 12: resolver 端到端 ----------

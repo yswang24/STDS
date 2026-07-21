@@ -4,9 +4,11 @@ vllm 和 custom 都是 OpenAI 兼容 API(/v1/chat/completions),只是配置不�
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from typing import Optional, Type
+import re
+from typing import Any, Optional, Type
 
 import httpx
 from pydantic import BaseModel
@@ -19,6 +21,115 @@ logger = logging.getLogger("stds.llm")
 
 class LLMError(Exception):
     pass
+
+
+class _LLMResponseError(LLMError):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _schema_name(schema: Type[BaseModel]) -> str:
+    """vLLM/OpenAI json_schema name 仅保留安全字符。"""
+    name = re.sub(r"[^a-zA-Z0-9_-]", "_", schema.__name__)
+    return (name or "structured_output")[:64]
+
+
+def _response_error_message(status_code: int, data: Any) -> str:
+    message = ""
+    code = ""
+    if isinstance(data, dict):
+        error = data.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or error.get("detail") or error)
+            code = str(error.get("code") or error.get("type") or "")
+        elif error is not None:
+            message = str(error)
+        if not message:
+            message = str(data.get("message") or data.get("detail") or "")
+        keys = ",".join(sorted(str(key) for key in data.keys()))
+    else:
+        message = str(data)
+        keys = type(data).__name__
+    suffix = f" code={code}" if code else ""
+    detail = message[:1000] if message else f"response keys={keys}"
+    return f"HTTP {status_code}{suffix}: {detail}"
+
+
+def _json_from_content(content: Any) -> Any:
+    if isinstance(content, dict):
+        return content
+    if isinstance(content, list):
+        text_blocks = [
+            str(block.get("text") or block.get("content") or "")
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") in {"text", "output_text"}
+        ]
+        if text_blocks:
+            content = "".join(text_blocks)
+        else:
+            return content
+    if not isinstance(content, str):
+        raise ValueError(f"message.content 类型不受支持: {type(content).__name__}")
+
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+        raise
+
+
+def _parse_chat_response(response) -> Any:
+    status_code = int(getattr(response, "status_code", 200))
+    try:
+        data = response.json()
+    except Exception as exc:
+        body = str(getattr(response, "text", ""))[:1000]
+        raise _LLMResponseError(
+            status_code,
+            f"HTTP {status_code}: 非 JSON 响应 {body!r}",
+        ) from exc
+    if status_code >= 400:
+        raise _LLMResponseError(
+            status_code,
+            _response_error_message(status_code, data),
+        )
+    if not isinstance(data, dict):
+        raise _LLMResponseError(
+            status_code,
+            f"HTTP {status_code}: 响应顶层应为 object，实际为 {type(data).__name__}",
+        )
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise _LLMResponseError(
+            status_code,
+            "OpenAI 兼容响应缺少 choices；" + _response_error_message(status_code, data),
+        )
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise _LLMResponseError(status_code, "choices[0] 不是 object")
+    message = choice.get("message")
+    if isinstance(message, dict):
+        if message.get("parsed") is not None:
+            return message["parsed"]
+        content = message.get("content")
+    else:
+        content = choice.get("text")
+    if content is None:
+        raise _LLMResponseError(status_code, "choices[0] 中没有 message.content")
+    logger.debug("[LLM] response: %s", str(content)[:300])
+    return _json_from_content(content)
 
 
 # ---------- Mock ----------
@@ -62,11 +173,52 @@ def get_mock_llm() -> _MockLLM:
 class _OpenAIClient:
     """任意 OpenAI 兼容 API:/v1/chat/completions,强制 JSON 输出。"""
 
-    def __init__(self, base_url: str, api_key: str, model: str, extra_headers: dict = None):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        extra_headers: dict = None,
+        *,
+        vllm_json_schema: bool = False,
+    ):
         self.base = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.extra_headers = extra_headers or {}
+        self.vllm_json_schema = vllm_json_schema
+
+    def _request_payload(
+        self,
+        model: str,
+        messages: list,
+        schema: Type[BaseModel],
+        *,
+        legacy_vllm: bool,
+    ) -> dict:
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 512,
+            "stream": False,
+        }
+        json_schema = schema.model_json_schema()
+        if self.vllm_json_schema:
+            if legacy_vllm:
+                # vLLM 旧版 OpenAI server 使用顶层 guided_json。
+                payload["guided_json"] = json_schema
+            else:
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": _schema_name(schema),
+                        "schema": json_schema,
+                    },
+                }
+        else:
+            payload["response_format"] = {"type": "json_object"}
+        return payload
 
     async def structured(
         self,
@@ -91,32 +243,44 @@ class _OpenAIClient:
         headers = {"Authorization": f"Bearer {self.api_key}", **self.extra_headers}
         logger.debug(f"[LLM] model={model} backend={self.base}")
         logger.debug(f"[LLM] prompt:\n{full_prompt[:500]}...")
-        for attempt in range(retries + 1):
+        retry_count = 0
+        legacy_vllm = False
+        while True:
             try:
                 r = httpx.post(
                     f"{self.base}/chat/completions",
                     headers=headers,
-                    json={
-                        "model": model,
-                        "messages": messages,
-                        "temperature": 0.1,
-                        "max_tokens": 512,
-                        "response_format": {"type": "json_object"},
-                        "stream": False,
-                    },
+                    json=self._request_payload(
+                        model,
+                        messages,
+                        schema,
+                        legacy_vllm=legacy_vllm,
+                    ),
                     timeout=120,
                 )
-                content = r.json()["choices"][0]["message"]["content"]
-                logger.debug(f"[LLM] response: {content[:300]}")
-                text = content.strip()
-                if text.startswith("```"):
-                    text = text.split("```")[1]
-                    if text.startswith("json"):
-                        text = text[4:]
-                data = json.loads(text)
+                data = _parse_chat_response(r)
                 return schema.model_validate(data)
-            except Exception as e:
-                last = e
+            except Exception as exc:
+                last = exc
+                if (
+                    self.vllm_json_schema
+                    and not legacy_vllm
+                    and isinstance(exc, _LLMResponseError)
+                    and exc.status_code in {400, 422}
+                ):
+                    legacy_vllm = True
+                    logger.warning(
+                        "[LLM] vLLM 不接受 json_schema，降级使用 guided_json: %s",
+                        exc,
+                    )
+                    continue
+                if retry_count >= retries:
+                    break
+                if isinstance(exc, _LLMResponseError) and (
+                    exc.status_code == 429 or exc.status_code >= 500
+                ):
+                    await asyncio.sleep(min(2 ** retry_count, 4))
+                retry_count += 1
         raise LLMError(f"OpenAI 兼容 API 结构化失败(重试{retries}次): {last}")
 
 
@@ -213,7 +377,12 @@ def _get_backend():
 
 def _make_client(backend: str):
     if backend == "vllm":
-        return _OpenAIClient(settings.VLLM_BASE_URL, settings.VLLM_API_KEY, settings.VLLM_LLM_MODEL)
+        return _OpenAIClient(
+            settings.VLLM_BASE_URL,
+            settings.VLLM_API_KEY,
+            settings.VLLM_LLM_MODEL,
+            vllm_json_schema=True,
+        )
     elif backend == "custom":
         return _OpenAIClient(
             settings.CUSTOM_API_BASE_URL, settings.CUSTOM_API_KEY, settings.CUSTOM_LLM_MODEL,
