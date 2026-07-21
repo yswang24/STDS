@@ -210,23 +210,43 @@ def test_machine_operation_is_not_decomposed_and_outputs_na_analysis_fields():
     assert [ws.cell(2, col).value for col in range(4, 9)] == ["NA"] * 5
 
 
-@pytest.mark.parametrize(
-    ("headers", "message"),
-    [
-        (["number", "station_op", "operation"], "必须依次为"),
-    ],
-)
-def test_header_aliases_are_not_mapped(headers, message):
+def test_english_header_aliases_are_supported():
+    async def fake_resolver(element, deps, *, machine_hint=None):
+        return _result(element)
+
     wb = Workbook()
     ws = wb.active
     ws.title = INPUT_SHEET_NAME
-    ws.append(headers)
+    ws.append([" NUMBER ", "Station_Op", "\ufeffoperation\n", "父记录"])
     ws.append([1, "OP010", "人工拿取零件"])
     payload = BytesIO()
     wb.save(payload)
 
-    with pytest.raises(ExcelInputError, match=message):
-        asyncio.run(_analyze_excel_bytes(payload.getvalue(), "错误模板.xlsx", object()))
+    batch = asyncio.run(
+        _analyze_excel_bytes(
+            payload.getvalue(),
+            "英文表头.xlsx",
+            object(),
+            resolver=fake_resolver,
+        )
+    )
+    result_ws = load_workbook(BytesIO(batch.output_bytes))[INPUT_SHEET_NAME]
+    assert result_ws.cell(2, 1).value == 1
+    assert result_ws.cell(2, 2).value == "OP010"
+    assert result_ws.cell(2, 3).value == "人工拿取零件"
+
+
+def test_unknown_header_alias_is_rejected():
+    wb = Workbook()
+    ws = wb.active
+    ws.title = INPUT_SHEET_NAME
+    ws.append(["num", "station", "op"])
+    ws.append([1, "OP010", "人工拿取零件"])
+    payload = BytesIO()
+    wb.save(payload)
+
+    with pytest.raises(ExcelInputError, match="序号/number"):
+        asyncio.run(_analyze_excel_bytes(payload.getvalue(), "未知表头.xlsx", object()))
 
 
 def test_header_hidden_characters_and_whitespace_are_cleaned():

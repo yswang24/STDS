@@ -36,6 +36,14 @@ NUMBER_HEADER = "序号"
 STATION_HEADER = "工位号"
 OUTPUT_OPERATION_HEADER = "操作内容"
 INPUT_HEADERS = (NUMBER_HEADER, STATION_HEADER, OUTPUT_OPERATION_HEADER)
+INPUT_HEADER_ALIASES = {
+    NUMBER_HEADER: NUMBER_HEADER,
+    "number": NUMBER_HEADER,
+    STATION_HEADER: STATION_HEADER,
+    "station_op": STATION_HEADER,
+    OUTPUT_OPERATION_HEADER: OUTPUT_OPERATION_HEADER,
+    "operation": OUTPUT_OPERATION_HEADER,
+}
 DECISION_HEADER = "决策描述"
 CHARTCODE_HEADER = "动作代码"
 CV_HEADER = "增值/非增值(C/V)"
@@ -328,8 +336,13 @@ def _clean_header(value: object) -> str:
     return "".join(char for char in text if not char.isspace() and char not in invisible)
 
 
+def _canonical_header(value: object) -> str:
+    cleaned = _clean_header(value)
+    return INPUT_HEADER_ALIASES.get(cleaned.casefold(), cleaned)
+
+
 def _load_inputs(excel_bytes: bytes):
-    """清洗并校验 数据表!A:C，忽略后续列且不做字段名称映射。"""
+    """清洗并映射 数据表!A:C 的中英表头，忽略后续列。"""
     if not excel_bytes:
         raise ExcelInputError("上传的 Excel 文件为空")
     try:
@@ -343,10 +356,11 @@ def _load_inputs(excel_bytes: bytes):
 
     ws = workbook[INPUT_SHEET_NAME]
     values_ws = values_workbook[INPUT_SHEET_NAME]
-    actual_headers = tuple(_clean_header(ws.cell(1, col).value) for col in range(1, 4))
+    actual_headers = tuple(_canonical_header(ws.cell(1, col).value) for col in range(1, 4))
     if actual_headers != INPUT_HEADERS:
         raise ExcelInputError(
-            "数据表第 1 行必须依次为：" + "、".join(INPUT_HEADERS)
+            "数据表第 1 行必须依次为：序号/number、工位号/station_op、"
+            "操作内容/operation"
         )
 
     input_rows: list[ExcelInputRow] = []

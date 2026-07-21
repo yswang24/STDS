@@ -81,13 +81,16 @@ st.title("⏱️ STDS 工时分析系统")
 # ---------- Excel 批量输入 ----------
 st.subheader("📤 Excel 批量分析")
 st.caption(
-    "固定读取“数据表”的序号、工位号、操作内容三列；"
+    "读取“数据表”的序号/number、工位号/station_op、操作内容/operation 三列；"
     "系统会先拆解人工动作，再逐条计算工时，并输出固定九列结果。"
 )
 uploaded_file = st.file_uploader(
     "上传 Excel 文件",
     type=["xlsx"],
-    help="读取数据表前三列：序号 / 工位号 / 操作内容；后续已有列会被忽略",
+    help=(
+        "读取数据表前三列：序号/number、工位号/station_op、"
+        "操作内容/operation；后续已有列会被忽略"
+    ),
 )
 
 uploaded_bytes = uploaded_file.getvalue() if uploaded_file is not None else None
