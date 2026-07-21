@@ -121,6 +121,17 @@ def test_fixed_template_is_flattened_to_exact_nine_columns():
     assert ws.auto_filter.ref == "A1:I6"
     assert batch.output_filename == "1.STDS-PF清单 副本_解析结果.xlsx"
     assert batch.detail_sheet_name == INPUT_SHEET_NAME
+    front_end_rows = batch.detail_preview_rows()
+    assert tuple(front_end_rows[0]) == OUTPUT_HEADERS
+    assert [row["序号"] for row in front_end_rows] == [2] * 5
+    assert [row["工位号"] for row in front_end_rows] == ["OP010"] * 5
+    assert [row["操作内容"] for row in front_end_rows] == child_operations
+    assert [row["决策描述"] for row in front_end_rows] == ["T,90,NB"] * 5
+    assert [row["动作代码"] for row in front_end_rows] == ["202 010"] * 5
+    assert [row["增值/非增值(C/V)"] for row in front_end_rows] == ["V"] * 5
+    assert [row["频率"] for row in front_end_rows] == [1.0] * 5
+    assert [row["时间"] for row in front_end_rows] == [1.2] * 5
+    assert all(json.loads(row[TRACE_HEADER]) for row in front_end_rows)
 
 
 def test_duplicate_operations_are_analyzed_once_but_each_source_row_is_output():
@@ -208,6 +219,7 @@ def test_machine_operation_is_not_decomposed_and_outputs_na_analysis_fields():
     ws = load_workbook(BytesIO(batch.output_bytes))[INPUT_SHEET_NAME]
     assert ws.cell(2, 3).value == "设备自动托盘进入"
     assert [ws.cell(2, col).value for col in range(4, 9)] == ["NA"] * 5
+    assert list(batch.detail_preview_rows()[0].values())[3:8] == ["NA"] * 5
 
 
 def test_english_header_aliases_are_supported():

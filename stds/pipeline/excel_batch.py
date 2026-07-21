@@ -161,6 +161,10 @@ class ExcelDetailResult:
             _detail_trace(self),
         ]
 
+    def output_row(self) -> dict:
+        """前端明细与下载工作簿共用的固定九列记录。"""
+        return dict(zip(OUTPUT_HEADERS, self.output_values()))
+
     def time_value(self) -> Optional[float]:
         if self.split.needs_review or self.result is None:
             return None
@@ -265,7 +269,7 @@ class ExcelBatchOutput:
         ]
 
     def detail_preview_rows(self) -> list[dict]:
-        return [detail.as_preview() for row in self.rows for detail in row.details]
+        return [detail.output_row() for row in self.rows for detail in row.details]
 
     @property
     def detail_count(self) -> int:
@@ -520,7 +524,9 @@ def _write_results(workbook, rows: list[ExcelRowResult]) -> tuple[bytes, str]:
     output_row = 2
     for row in rows:
         for detail in row.details:
-            for col, value in enumerate(detail.output_values(), start=1):
+            detail_row = detail.output_row()
+            for col, header in enumerate(OUTPUT_HEADERS, start=1):
+                value = detail_row[header]
                 cell = ws.cell(output_row, col, value)
                 cell.alignment = Alignment(
                     vertical="top",

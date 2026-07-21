@@ -28,6 +28,8 @@ from stds.pipeline.excel_batch import ExcelInputError, ExcelProgress, analyze_ex
 from stds.pipeline.operation_analysis import OperationAnalysis, analyze_operation
 from stds.review.flywheel import on_review_confirmed
 
+BATCH_OUTPUT_SCHEMA_VERSION = 2
+
 # ---------- 初始化(缓存到 session_state) ----------
 if "charts" not in st.session_state:
     st.session_state.charts = load_charts()
@@ -36,6 +38,9 @@ if "charts" not in st.session_state:
     st.session_state.history = []  # 分析历史
 if "batch_output" not in st.session_state:
     st.session_state.batch_output = None
+if st.session_state.get("batch_output_schema_version") != BATCH_OUTPUT_SCHEMA_VERSION:
+    st.session_state.batch_output = None
+    st.session_state.batch_output_schema_version = BATCH_OUTPUT_SCHEMA_VERSION
 if "single_output" not in st.session_state:
     st.session_state.single_output = None
     st.session_state.single_run_id = 0
@@ -217,6 +222,17 @@ if (
     phase_col1.metric("拆解阶段耗时", f"{batch_output['decompose_elapsed_s']:.2f} 秒")
     phase_col2.metric("工时分析阶段耗时", f"{batch_output['analysis_elapsed_s']:.2f} 秒")
 
+    st.download_button(
+        "⬇️ 下载完整结果（XLSX）",
+        data=batch_output["bytes"],
+        file_name=batch_output["filename"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+    st.caption(
+        "上方按钮下载完整 XLSX；表格右上角的“Download as CSV”是 Streamlit 自带的当前表格导出。"
+    )
+
     with st.expander("🧩 拆解中间结果", expanded=True):
         st.dataframe(
             batch_output["decomposition"],
@@ -241,13 +257,6 @@ if (
     with st.expander("📊 原始 Excel 行汇总", expanded=False):
         st.dataframe(batch_output["preview"], hide_index=True, width="stretch")
     st.caption(f"下载结果中的逐条拆解与工时明细位于“{batch_output['detail_sheet_name']}”工作表。")
-    st.download_button(
-        "⬇️ 下载结果 Excel",
-        data=batch_output["bytes"],
-        file_name=batch_output["filename"],
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
 
 st.divider()
 st.subheader("✍️ 单条分析（可选）")
