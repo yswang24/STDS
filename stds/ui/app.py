@@ -1,7 +1,7 @@
 """Streamlit UI:交互式工时分析系统。
 
 核心功能:
-  1. 上传 Excel → 批量分析 operation → 下载追加结果列的 Excel
+  1. 上传 Excel → 拆解 operation → 逐条工时分析 → 下载结果 Excel
   2. 单条操作描述 → 实时分析(chartcode/决策串/时间/trace)
   3. 可修改结果并确认(飞轮回灌)
   4. Prompt 编辑(侧边栏,热更新)
@@ -19,13 +19,13 @@ import streamlit as st
 from stds.config.logging_config import setup_logging
 setup_logging(level="DEBUG", log_file="stds_debug.log")
 
-from stds.cascade.resolver import Deps, resolve
+from stds.cascade.resolver import Deps
 from stds.data.cache import AutoCache
 from stds.data.charts_loader import load_charts
 from stds.data.common_chart import load_common_chart
-from stds.domain.models import StdsElement, StdsResult
 from stds.llm.pick_value import pick_value
 from stds.pipeline.excel_batch import ExcelInputError, ExcelProgress, analyze_excel_bytes
+from stds.pipeline.operation_analysis import OperationAnalysis, analyze_operation
 from stds.review.flywheel import on_review_confirmed
 
 # ---------- 初始化(缓存到 session_state) ----------
@@ -36,6 +36,9 @@ if "charts" not in st.session_state:
     st.session_state.history = []  # 分析历史
 if "batch_output" not in st.session_state:
     st.session_state.batch_output = None
+if "single_output" not in st.session_state:
+    st.session_state.single_output = None
+    st.session_state.single_run_id = 0
 
 PROMPTS_DIR = Path(__file__).parent.parent / "llm" / "prompts"
 
@@ -77,7 +80,10 @@ st.title("⏱️ STDS 工时分析系统")
 
 # ---------- Excel 批量输入 ----------
 st.subheader("📤 Excel 批量分析")
-st.caption("工作簿需包含 operation 表头；系统会保留原内容，并追加决策串、逐步的决策选择（trace）、时间三列。")
+st.caption(
+    "工作簿需包含 operation 表头；系统会先拆解人工动作，再逐条计算工时。"
+    "原表追加决策串、逐步的决策选择（trace）、时间三列，下载文件另含拆解明细表。"
+)
 uploaded_file = st.file_uploader(
     "上传 Excel 文件",
     type=["xlsx"],
@@ -96,21 +102,37 @@ batch_submitted = st.button(
 if batch_submitted and uploaded_file is not None:
     progress_bar = st.progress(0.0)
     progress_text = st.empty()
+    decomposition_details = st.empty()
     progress_details = st.empty()
     timing_rows = []
+    live_decomposition_rows = []
 
     def update_batch_progress(progress: ExcelProgress):
-        progress_bar.progress(progress.completed_rows / progress.total_rows)
-        coverage = (
-            f"｜本次覆盖 {progress.affected_rows} 行"
-            if progress.affected_rows > 1
-            else ""
-        )
+        progress_bar.progress(progress.overall_ratio)
         progress_text.text(
-            f"正在解析：{progress.completed_rows}/{progress.total_rows}"
-            f"｜本条 {progress.item_elapsed_s:.2f} 秒{coverage}"
+            f"正在{progress.phase}：{progress.completed_rows}/{progress.total_rows}"
+            f"｜本条 {progress.item_elapsed_s:.2f} 秒"
             f"｜累计 {progress.total_elapsed_s:.2f} 秒"
         )
+        if progress.phase == "拆解":
+            for index, operation in enumerate(progress.generated_operations, start=1):
+                live_decomposition_rows.append(
+                    {
+                        "工作表": progress.sheet_name,
+                        "Excel行": progress.row_index,
+                        "原始operation": progress.operation,
+                        "主体类型": progress.actor,
+                        "拆解序号": f"{index}/{len(progress.generated_operations)}",
+                        "拆解后operation": operation,
+                        "本条拆解耗时（秒）": round(progress.item_elapsed_s, 2),
+                    }
+                )
+            decomposition_details.dataframe(
+                live_decomposition_rows,
+                hide_index=True,
+                width="stretch",
+                height=min(360, 38 + len(live_decomposition_rows) * 35),
+            )
         timing_rows.append(progress.as_preview())
         progress_details.dataframe(
             timing_rows,
@@ -139,13 +161,19 @@ if batch_submitted and uploaded_file is not None:
             "filename": batch_result.output_filename,
             "bytes": batch_result.output_bytes,
             "preview": batch_result.preview_rows(),
+            "decomposition": batch_result.decomposition_rows(),
+            "details": batch_result.detail_preview_rows(),
             "processed": batch_result.processed_count,
             "review": batch_result.review_count,
             "failed": batch_result.failed_count,
             "total_count": batch_result.total_count,
+            "detail_count": batch_result.detail_count,
             "total_elapsed_s": batch_result.total_elapsed_s,
+            "decompose_elapsed_s": batch_result.decompose_elapsed_s,
+            "analysis_elapsed_s": batch_result.analysis_elapsed_s,
             "average_elapsed_s": batch_result.average_elapsed_s,
             "timings": batch_result.timing_rows(),
+            "detail_sheet_name": batch_result.detail_sheet_name,
         }
     except ExcelInputError as exc:
         st.session_state.batch_output = None
@@ -156,6 +184,7 @@ if batch_submitted and uploaded_file is not None:
     finally:
         progress_bar.empty()
         progress_text.empty()
+        decomposition_details.empty()
         progress_details.empty()
 
 batch_output = st.session_state.batch_output
@@ -170,12 +199,34 @@ if (
             f"失败 {batch_output['failed']} 条；原因已写入 trace 列。"
         )
     else:
-        st.success(f"已完成 {batch_output['processed']} 条 operation 解析")
+        st.success(
+            f"已完成 {batch_output['processed']} 条原始 operation，"
+            f"共得到 {batch_output['detail_count']} 条拆解动作"
+        )
 
-    total_col, elapsed_col, average_col = st.columns(3)
-    total_col.metric("总计条数", batch_output["total_count"])
+    total_col, detail_col, elapsed_col, average_col = st.columns(4)
+    total_col.metric("原始条数", batch_output["total_count"])
+    detail_col.metric("拆解后条数", batch_output["detail_count"])
     elapsed_col.metric("总耗时", f"{batch_output['total_elapsed_s']:.2f} 秒")
-    average_col.metric("平均每条", f"{batch_output['average_elapsed_s']:.2f} 秒")
+    average_col.metric("平均每个原始动作", f"{batch_output['average_elapsed_s']:.2f} 秒")
+
+    phase_col1, phase_col2 = st.columns(2)
+    phase_col1.metric("拆解阶段耗时", f"{batch_output['decompose_elapsed_s']:.2f} 秒")
+    phase_col2.metric("工时分析阶段耗时", f"{batch_output['analysis_elapsed_s']:.2f} 秒")
+
+    with st.expander("🧩 拆解中间结果", expanded=True):
+        st.dataframe(
+            batch_output["decomposition"],
+            hide_index=True,
+            width="stretch",
+        )
+
+    with st.expander("📋 拆解动作工时分析明细", expanded=True):
+        st.dataframe(
+            batch_output["details"],
+            hide_index=True,
+            width="stretch",
+        )
 
     with st.expander("⏱️ 逐条处理耗时", expanded=False):
         st.dataframe(
@@ -184,7 +235,9 @@ if (
             width="stretch",
         )
 
-    st.dataframe(batch_output["preview"], width="stretch")
+    with st.expander("📊 原始 Excel 行汇总", expanded=False):
+        st.dataframe(batch_output["preview"], hide_index=True, width="stretch")
+    st.caption(f"下载结果中的逐条拆解与工时明细位于“{batch_output['detail_sheet_name']}”工作表。")
     st.download_button(
         "⬇️ 下载结果 Excel",
         data=batch_output["bytes"],
@@ -218,72 +271,194 @@ if analyze_submitted and not operation.strip():
 
 # ---------- 分析提交 ----------
 if analyze_submitted and operation.strip():
-    with st.spinner("分析中..."):
+    live_decomposition = st.empty()
+    live_progress = st.empty()
+    live_details = st.empty()
+    live_analysis_rows = {}
+
+    with st.status("正在拆解原始动作…", expanded=True) as single_status:
         charts = st.session_state.charts
         cache = st.session_state.cache
         common_rows = st.session_state.common_rows
 
+        def show_decomposition(split, elapsed_s):
+            single_status.update(label="拆解完成，正在逐条进行工时分析…")
+            live_decomposition.dataframe(
+                [
+                    {
+                        "原始operation": operation.strip(),
+                        "主体类型": split.actor,
+                        "拆解序号": f"{index}/{len(split.operations)}",
+                        "拆解后operation": child,
+                        "拆解来源": split.source,
+                        "拆解耗时（秒）": round(elapsed_s, 2),
+                    }
+                    for index, child in enumerate(split.operations, start=1)
+                ],
+                hide_index=True,
+                width="stretch",
+            )
+
+        def show_item_progress(item, completed, total):
+            live_progress.progress(
+                completed / total,
+                text=f"工时分析：{completed}/{total}｜本条 {item.elapsed_s:.2f} 秒",
+            )
+            live_analysis_rows[item.index] = {
+                "拆解序号": f"{item.index}/{item.total}",
+                "operation": item.operation,
+                "Chartcode": item.result.chartcode if item.result else "",
+                "决策串": item.result.decision if item.result else "",
+                "标准时间（秒）": (
+                    item.result.time_s
+                    if item.result is not None and item.status == "成功"
+                    else None
+                ),
+                "分析耗时（秒）": round(item.elapsed_s, 2),
+                "状态": item.status,
+            }
+            live_details.dataframe(
+                [live_analysis_rows[index] for index in sorted(live_analysis_rows)],
+                hide_index=True,
+                width="stretch",
+            )
+
         async def do_analyze():
             deps = Deps(charts=charts, cache=cache, common_rows=common_rows, llm_pick_value=pick_value)
-            el = StdsElement(
-                number=1,
-                operation_des=operation.strip(),
+            return await analyze_operation(
+                operation.strip(),
+                deps,
                 line_name=line or "手动输入",
                 station_op=station or "手动输入",
                 freq=freq,
-                norm_key=operation.strip(),
+                on_decomposed=show_decomposition,
+                on_progress=show_item_progress,
             )
-            return await resolve(el, deps)
 
-        result: StdsResult = asyncio.run(do_analyze())
+        single_analysis: OperationAnalysis = asyncio.run(do_analyze())
+        st.session_state.single_run_id += 1
+        st.session_state.single_output = {
+            "run_id": st.session_state.single_run_id,
+            "analysis": single_analysis,
+        }
+        status_state = "complete" if single_analysis.status == "成功" else "error"
+        single_status.update(
+            label=(
+                f"单条分析完成：{len(single_analysis.items)} 个拆解动作，"
+                f"总耗时 {single_analysis.total_elapsed_s:.2f} 秒"
+            ),
+            state=status_state,
+        )
 
-    # ---------- 结果展示 ----------
+    live_decomposition.empty()
+    live_progress.empty()
+    live_details.empty()
+
+# ---------- 单条结果展示 ----------
+single_output = st.session_state.single_output
+if single_output is not None:
+    single_analysis: OperationAnalysis = single_output["analysis"]
+    single_run_id = single_output["run_id"]
     st.divider()
-    st.subheader("📋 分析结果")
+    st.subheader("📋 单条分析结果")
 
-    # 状态标签
+    total_time_display = (
+        f"{single_analysis.total_time_s:.2f} s"
+        if single_analysis.total_time_s is not None
+        else "待复核"
+    )
+    scol1, scol2, scol3, scol4 = st.columns(4)
+    scol1.metric("主体类型", single_analysis.split.actor)
+    scol2.metric("拆解动作数", len(single_analysis.items))
+    scol3.metric("标准时间总计", total_time_display)
+    scol4.metric("处理总耗时", f"{single_analysis.total_elapsed_s:.2f} s")
+    st.caption(
+        f"拆解阶段 {single_analysis.decompose_elapsed_s:.2f} 秒｜"
+        f"工时分析阶段 {single_analysis.analysis_elapsed_s:.2f} 秒｜"
+        f"状态：{single_analysis.status}"
+    )
+
+    if single_analysis.split.error:
+        st.warning(
+            "拆解阶段出现异常，已回退为原始动作并标记待复核："
+            f"{single_analysis.split.error}"
+        )
+
+    with st.expander("🧩 拆解中间结果", expanded=True):
+        st.dataframe(
+            single_analysis.decomposition_rows(),
+            hide_index=True,
+            width="stretch",
+        )
+
+    with st.expander("📊 拆解动作工时明细", expanded=True):
+        st.dataframe(
+            single_analysis.detail_rows(),
+            hide_index=True,
+            width="stretch",
+        )
+
     source_colors = {"cache": "🟢", "knn": "🔵", "formula": "🟡", "unresolved": "🔴", "machine": "⚪"}
     source_labels = {"cache": "缓存命中", "knn": "历史匹配", "formula": "公式计算", "unresolved": "待复核", "machine": "设备"}
-    color = source_colors.get(result.source.value, "⚪")
-    label = source_labels.get(result.source.value, result.source.value)
 
-    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-    mcol1.metric("动作代码", result.chartcode or "—")
-    mcol2.metric("标准时间", f"{result.time_s:.2f} s")
-    mcol3.metric("置信度", f"{result.confidence:.0%}")
-    mcol4.metric("来源", f"{color} {label}")
+    for item in single_analysis.items:
+        st.markdown(f"#### {item.index}/{item.total}　{item.operation}")
+        if item.error or item.result is None:
+            st.error(item.error or "该动作分析失败")
+            continue
 
-    # 决策详情
-    with st.expander("🔍 决策详情", expanded=True):
-        dc1, dc2 = st.columns(2)
-        with dc1:
-            st.text_input("决策串", value=result.decision, disabled=True, key="dec_display")
-            st.text_input("增值/非增值", value=result.cv, disabled=True, key="cv_display")
-            st.text_input("频率", value=str(result.freq), disabled=True, key="freq_display")
-        with dc2:
-            st.text_input("操作描述", value=result.element.operation_des, disabled=True, key="op_display")
-            st.text_input("需复核", value="是" if result.needs_review else "否", disabled=True, key="review_display")
+        result = item.result
+        color = source_colors.get(result.source.value, "⚪")
+        label = source_labels.get(result.source.value, result.source.value)
+        mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+        mcol1.metric("动作代码", result.chartcode or "—")
+        mcol2.metric("标准时间", f"{result.time_s:.2f} s")
+        mcol3.metric("置信度", f"{result.confidence:.0%}")
+        mcol4.metric("来源", f"{color} {label}")
+        st.caption(
+            f"决策串：{result.decision or '—'}｜频率：{result.freq}｜"
+            f"本条处理耗时：{item.elapsed_s:.2f} 秒｜"
+            f"需复核：{'是' if result.needs_review else '否'}"
+        )
 
-    # Trace(逐步选择)
-    if result.trace:
-        with st.expander("📜 逐步选择(Trace)", expanded=False):
-            for i, step in enumerate(result.trace):
-                var, desc, reason = step
-                st.markdown(f"**{var}**: {desc}  \n原因: {reason}")
+        if result.trace:
+            with st.expander(f"📜 {item.index}/{item.total} 逐步选择（Trace）", expanded=False):
+                for step in result.trace:
+                    if isinstance(step, (list, tuple)) and len(step) >= 3:
+                        var, desc, reason = step[:3]
+                    else:
+                        var, desc, reason = "trace", str(step), ""
+                    st.markdown(f"**{var}**：{desc}  \n原因：{reason}")
 
-    # ---------- 复核编辑 ----------
-    if result.needs_review or True:  # 始终允许编辑
-        with st.expander("✏️ 人工复核(可编辑)", expanded=result.needs_review):
+        with st.expander(
+            f"✏️ {item.index}/{item.total} 人工复核（可编辑）",
+            expanded=result.needs_review,
+        ):
             ec1, ec2, ec3 = st.columns(3)
             with ec1:
-                edit_cc = st.text_input("动作代码", value=result.chartcode or "", key="edit_cc")
+                edit_cc = st.text_input(
+                    "动作代码",
+                    value=result.chartcode or "",
+                    key=f"single_{single_run_id}_{item.index}_cc",
+                )
             with ec2:
-                edit_dec = st.text_input("决策串", value=result.decision, key="edit_dec")
+                edit_dec = st.text_input(
+                    "决策串",
+                    value=result.decision,
+                    key=f"single_{single_run_id}_{item.index}_decision",
+                )
             with ec3:
-                edit_time = st.number_input("时间(s)", value=result.time_s, step=0.1, key="edit_time")
+                edit_time = st.number_input(
+                    "时间(s)",
+                    value=result.time_s,
+                    step=0.1,
+                    key=f"single_{single_run_id}_{item.index}_time",
+                )
 
-            if st.button("✅ 确认并回灌"):
-                # 应用编辑
+            if st.button(
+                "✅ 确认并回灌",
+                key=f"single_{single_run_id}_{item.index}_confirm",
+            ):
                 from dataclasses import replace
                 edited = replace(
                     result,
@@ -294,21 +469,22 @@ if analyze_submitted and operation.strip():
                     needs_review=False,
                     confidence=1.0,
                 )
-                # 飞轮回灌
                 on_review_confirmed(result.element, edited, type("Deps", (), {
                     "cache": st.session_state.cache,
                     "history_index": None,
                     "goldens": [],
                 })())
-                # 记录历史
+                item.result = edited
                 st.session_state.history.append({
-                    "操作": operation,
+                    "原始操作": single_analysis.original_operation,
+                    "操作": item.operation,
                     "chartcode": edit_cc,
                     "决策": edit_dec,
                     "时间": edit_time,
                     "已编辑": True,
                 })
-                st.success("✅ 已回灌(缓存已更新,下次相同操作直接命中)")
+                st.success("✅ 当前拆解动作已回灌（下次相同动作直接命中）")
+        st.divider()
 
 # ---------- 分析历史 ----------
 if st.session_state.history:

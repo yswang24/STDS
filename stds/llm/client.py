@@ -28,10 +28,25 @@ class _MockLLM:
         self._default_index = default_index
         self.call_count = 0
 
-    async def structured(self, prompt: str, schema: Type[BaseModel], model: Optional[str] = None, retries: int = 2):
+    async def structured(
+        self,
+        prompt: str,
+        schema: Type[BaseModel],
+        model: Optional[str] = None,
+        retries: int = 2,
+        *,
+        exact_system_prompt: bool = False,
+    ):
         self.call_count += 1
-        if hasattr(schema, "model_fields") and "index" in schema.model_fields:
+        fields = getattr(schema, "model_fields", {})
+        if "index" in fields:
             return schema(index=self._default_index, reason="mock")
+        if "auto" in fields:
+            return schema(auto=0)
+        if "operation" in fields:
+            marker = "用户输入:"
+            operation = prompt.split(marker, 1)[1].split("\n", 1)[0].strip() if marker in prompt else "mock operation"
+            return schema(operation=[operation or "mock operation"])
         return schema.model_validate({})
 
 
@@ -53,14 +68,26 @@ class _OpenAIClient:
         self.model = model
         self.extra_headers = extra_headers or {}
 
-    async def structured(self, prompt: str, schema: Type[BaseModel], model: Optional[str] = None, retries: int = 2):
+    async def structured(
+        self,
+        prompt: str,
+        schema: Type[BaseModel],
+        model: Optional[str] = None,
+        retries: int = 2,
+        *,
+        exact_system_prompt: bool = False,
+    ):
         model = model or self.model
-        schema_instr = render_prompt("schema_format", schema=schema.model_json_schema())
-        full_prompt = prompt + "\n" + schema_instr
-        messages = [
-            {"role": "system", "content": load_prompt("system")},
-            {"role": "user", "content": full_prompt},
-        ]
+        if exact_system_prompt:
+            full_prompt = prompt
+            messages = [{"role": "system", "content": prompt}]
+        else:
+            schema_instr = render_prompt("schema_format", schema=schema.model_json_schema())
+            full_prompt = prompt + "\n" + schema_instr
+            messages = [
+                {"role": "system", "content": load_prompt("system")},
+                {"role": "user", "content": full_prompt},
+            ]
         headers = {"Authorization": f"Bearer {self.api_key}", **self.extra_headers}
         logger.debug(f"[LLM] model={model} backend={self.base}")
         logger.debug(f"[LLM] prompt:\n{full_prompt[:500]}...")
@@ -100,10 +127,21 @@ class _OllamaClient:
         self.base = settings.OLLAMA_BASE
         self.model = settings.LLM_MODEL
 
-    async def structured(self, prompt: str, schema: Type[BaseModel], model: Optional[str] = None, retries: int = 2):
+    async def structured(
+        self,
+        prompt: str,
+        schema: Type[BaseModel],
+        model: Optional[str] = None,
+        retries: int = 2,
+        *,
+        exact_system_prompt: bool = False,
+    ):
         model = model or self.model
-        schema_instr = render_prompt("schema_format", schema=schema.model_json_schema())
-        full_prompt = prompt + "\n" + schema_instr
+        if exact_system_prompt:
+            full_prompt = prompt
+        else:
+            schema_instr = render_prompt("schema_format", schema=schema.model_json_schema())
+            full_prompt = prompt + "\n" + schema_instr
         for attempt in range(retries + 1):
             try:
                 r = httpx.post(
@@ -191,3 +229,28 @@ async def structured(prompt: str, schema: Type[BaseModel], model: Optional[str] 
     if backend == "mock":
         return await _mock.structured(prompt, schema, model, retries)
     return await _make_client(backend).structured(prompt, schema, model, retries)
+
+
+async def structured_system(
+    prompt: str,
+    schema: Type[BaseModel],
+    model: Optional[str] = None,
+    retries: int = 2,
+):
+    """将 prompt 原样作为 system message 发送，不拼接任何额外提示文本。"""
+    backend = _get_backend()
+    if backend == "mock":
+        return await _mock.structured(
+            prompt,
+            schema,
+            model,
+            retries,
+            exact_system_prompt=True,
+        )
+    return await _make_client(backend).structured(
+        prompt,
+        schema,
+        model,
+        retries,
+        exact_system_prompt=True,
+    )

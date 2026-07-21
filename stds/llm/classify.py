@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -12,7 +13,7 @@ logger = logging.getLogger("stds.llm.classify")
 
 
 class ClassifyOut(BaseModel):
-    auto: int  # 1=设备, 0=人工
+    auto: Literal[0, 1]  # 1=设备, 0=人工
 
 
 async def classify_machine(operation_des: str) -> bool:

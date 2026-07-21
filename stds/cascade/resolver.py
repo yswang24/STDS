@@ -48,10 +48,21 @@ def _put_cache_template(el: StdsElement, result: StdsResult, deps: Deps, unit_ti
     )
 
 
-async def resolve(el: StdsElement, deps: Deps) -> StdsResult:
+async def resolve(
+    el: StdsElement,
+    deps: Deps,
+    *,
+    machine_hint: Optional[bool] = None,
+) -> StdsResult:
     """单条记录:从输入到产出。"""
     op = el.operation_des
     logger.info(f"===== 开始分析: '{op}' (freq={el.freq}) =====")
+
+    # Excel 两阶段管线已对父动作判定过主体。设备动作直接返回，避免缓存或
+    # 第二次 LLM 分类改变同一批次的判定；人工动作仍可复用缓存和 kNN。
+    if machine_hint is True:
+        logger.info("  [T2] 沿用拆解阶段判定: 设备")
+        return StdsResult.machine_placeholder(el)
 
     # T0 精确缓存
     cached = deps.cache.get(el.norm_key)
@@ -125,12 +136,16 @@ async def resolve(el: StdsElement, deps: Deps) -> StdsResult:
                 logger.debug(f"  [T1] 邻居不一致或 chartcode 不在 charts,跳过")
 
     # T2 判人/设备(规则快速路径 + LLM 兜底)
-    m = rules.rule_machine(op)
+    m = machine_hint
     if m is not None:
-        logger.info(f"  [T2] 规则判定: {'设备' if m else '人工'}")
+        logger.info(f"  [T2] 沿用拆解阶段判定: {'设备' if m else '人工'}")
     else:
-        m = await deps.llm_classify(op)
-        logger.info(f"  [T2] LLM 判定: {'设备' if m else '人工'}")
+        m = rules.rule_machine(op)
+        if m is not None:
+            logger.info(f"  [T2] 规则判定: {'设备' if m else '人工'}")
+        else:
+            m = await deps.llm_classify(op)
+            logger.info(f"  [T2] LLM 判定: {'设备' if m else '人工'}")
     if m:
         logger.info(f"  → 结果: 设备动作,跳过计算")
         return StdsResult.machine_placeholder(el)

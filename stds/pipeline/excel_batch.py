@@ -7,12 +7,13 @@ import json
 import logging
 import time
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Callable, Optional
 
 from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import range_boundaries
 from openpyxl.worksheet.table import TableColumn
@@ -22,6 +23,14 @@ from stds.cascade.resolver import Deps, resolve
 from stds.cascade.rules import normalize
 from stds.config.settings import settings
 from stds.domain.models import Source, StdsElement, StdsResult
+from stds.llm.decompose import decompose_operation
+from stds.pipeline.operation_analysis import (
+    Decomposer,
+    OperationSplit,
+    Resolver,
+    resolve_with_actor,
+    split_operation,
+)
 
 logger = logging.getLogger("stds.excel_batch")
 
@@ -32,6 +41,9 @@ TIME_HEADER = "时间"
 RESULT_HEADERS = (DECISION_HEADER, TRACE_HEADER, TIME_HEADER)
 EXCEL_CELL_TEXT_LIMIT = 32767
 TRACE_FIELD_LIMIT = 8000
+DETAIL_SHEET_BASE = "STDS_拆解明细"
+PHASE_DECOMPOSE = "拆解"
+PHASE_ANALYZE = "工时分析"
 
 
 class ExcelInputError(ValueError):
@@ -50,8 +62,11 @@ class ExcelInputRow:
 
 
 @dataclass
-class ExcelRowResult:
+class ExcelDetailResult:
     input_row: ExcelInputRow
+    split: OperationSplit
+    child_index: int
+    operation: str
     result: Optional[StdsResult] = None
     error: Optional[str] = None
 
@@ -59,18 +74,106 @@ class ExcelRowResult:
     def status(self) -> str:
         if self.error is not None or self.result is None:
             return "失败"
-        if self.result.needs_review or self.result.source == Source.UNRESOLVED:
+        if (
+            self.split.needs_review
+            or self.result.needs_review
+            or self.result.source == Source.UNRESOLVED
+        ):
             return "待复核"
         return "成功"
+
+    @property
+    def child_count(self) -> int:
+        return len(self.split.operations)
+
+    def as_decomposition_preview(self) -> dict:
+        return {
+            "工作表": self.input_row.sheet_name,
+            "Excel行": self.input_row.row_index,
+            "原始operation": self.input_row.operation,
+            "主体类型": self.split.actor,
+            "拆解序号": f"{self.child_index}/{self.child_count}",
+            "拆解后operation": self.operation,
+            "拆解来源": self.split.source,
+            "状态": "待复核" if self.split.needs_review else "成功",
+        }
+
+    def as_preview(self) -> dict:
+        return {
+            **self.as_decomposition_preview(),
+            "Chartcode": self.result.chartcode if self.result else "",
+            DECISION_HEADER: self.result.decision if self.result else "",
+            TRACE_HEADER: _detail_trace(self),
+            TIME_HEADER: self.time_value(),
+            "状态": self.status,
+        }
+
+    def time_value(self) -> Optional[float]:
+        if self.split.needs_review or self.result is None:
+            return None
+        return _result_time(self.result)
+
+
+@dataclass
+class ExcelRowResult:
+    input_row: ExcelInputRow
+    split: OperationSplit
+    details: list[ExcelDetailResult]
+
+    @property
+    def status(self) -> str:
+        statuses = {detail.status for detail in self.details}
+        if "失败" in statuses:
+            return "失败"
+        if "待复核" in statuses:
+            return "待复核"
+        return "成功"
+
+    def decision_value(self) -> str:
+        if len(self.details) == 1:
+            result = self.details[0].result
+            return result.decision if result else ""
+        values = [
+            {
+                "拆解序号": f"{detail.child_index}/{detail.child_count}",
+                "operation": detail.operation,
+                DECISION_HEADER: detail.result.decision if detail.result else "",
+            }
+            for detail in self.details
+        ]
+        return _fit_excel_text(json.dumps(values, ensure_ascii=False, separators=(",", ":")))
+
+    def trace_value(self) -> str:
+        trace: list = [
+            (
+                "拆解",
+                json.dumps(self.split.operations, ensure_ascii=False),
+                f"主体={self.split.actor}; 来源={self.split.source}",
+            )
+        ]
+        if self.split.error:
+            trace.append(("拆解待复核", "回退为原动作", self.split.error))
+        for detail in self.details:
+            prefix = f"{detail.child_index}/{detail.child_count}"
+            trace.extend(_result_trace_items(detail.result, detail.error, prefix=prefix))
+        return serialize_trace(trace)
+
+    def time_value(self) -> Optional[float]:
+        values = [detail.time_value() for detail in self.details]
+        if any(value is None for value in values):
+            return None
+        return round(sum(value for value in values if value is not None), 2)
 
     def as_preview(self) -> dict:
         return {
             "工作表": self.input_row.sheet_name,
             "Excel行": self.input_row.row_index,
             "operation": self.input_row.operation,
-            DECISION_HEADER: self.result.decision if self.result else "",
-            TRACE_HEADER: _result_trace(self.result) if self.result else _error_trace(self.error),
-            TIME_HEADER: _result_time(self.result) if self.result else None,
+            "主体类型": self.split.actor,
+            "拆解数量": len(self.details),
+            DECISION_HEADER: self.decision_value(),
+            TRACE_HEADER: self.trace_value(),
+            TIME_HEADER: self.time_value(),
             "状态": self.status,
         }
 
@@ -82,10 +185,13 @@ class ExcelBatchOutput:
     rows: list[ExcelRowResult]
     timings: list["ExcelProgress"]
     total_elapsed_s: float
+    decompose_elapsed_s: float
+    analysis_elapsed_s: float
+    detail_sheet_name: str
 
     @property
     def processed_count(self) -> int:
-        return sum(row.result is not None for row in self.rows)
+        return sum(any(detail.result is not None for detail in row.details) for row in self.rows)
 
     @property
     def failed_count(self) -> int:
@@ -97,6 +203,20 @@ class ExcelBatchOutput:
 
     def preview_rows(self) -> list[dict]:
         return [row.as_preview() for row in self.rows]
+
+    def decomposition_rows(self) -> list[dict]:
+        return [
+            detail.as_decomposition_preview()
+            for row in self.rows
+            for detail in row.details
+        ]
+
+    def detail_preview_rows(self) -> list[dict]:
+        return [detail.as_preview() for row in self.rows for detail in row.details]
+
+    @property
+    def detail_count(self) -> int:
+        return sum(len(row.details) for row in self.rows)
 
     @property
     def total_count(self) -> int:
@@ -112,17 +232,39 @@ class ExcelBatchOutput:
 
 @dataclass(frozen=True)
 class ExcelProgress:
+    phase: str
     completed_rows: int
     total_rows: int
     operation: str
     affected_rows: int
     item_elapsed_s: float
     total_elapsed_s: float
+    generated_operations: tuple[str, ...] = ()
+    actor: str = ""
+    sheet_name: str = ""
+    row_index: Optional[int] = None
+    child_index: Optional[int] = None
+    child_count: Optional[int] = None
+
+    @property
+    def overall_ratio(self) -> float:
+        phase_ratio = self.completed_rows / self.total_rows if self.total_rows else 1.0
+        if self.phase == PHASE_DECOMPOSE:
+            return min(0.5, phase_ratio * 0.5)
+        return min(1.0, 0.5 + phase_ratio * 0.5)
 
     def as_preview(self) -> dict:
         return {
+            "阶段": self.phase,
             "完成进度": f"{self.completed_rows}/{self.total_rows}",
+            "工作表": self.sheet_name,
+            "Excel行": self.row_index,
             "operation": self.operation,
+            "拆解序号": (
+                f"{self.child_index}/{self.child_count}"
+                if self.child_index is not None and self.child_count is not None
+                else ""
+            ),
             "本条耗时（秒）": round(self.item_elapsed_s, 2),
             "覆盖 Excel 行数": self.affected_rows,
             "累计耗时（秒）": round(self.total_elapsed_s, 2),
@@ -138,7 +280,6 @@ class _SheetLayout:
     totals_row: Optional[int] = None
 
 
-Resolver = Callable[[StdsElement, Deps], Awaitable[StdsResult]]
 ProgressCallback = Callable[[ExcelProgress], object]
 
 
@@ -418,22 +559,51 @@ def serialize_trace(trace: list) -> str:
     return json.dumps(kept, ensure_ascii=False, separators=(",", ":"))
 
 
-def _error_trace(error: Optional[str]) -> str:
-    return serialize_trace([("ERROR", "", error or "未知错误")])
+def _fit_excel_text(value: str) -> str:
+    if len(value) <= EXCEL_CELL_TEXT_LIMIT:
+        return value
+    return value[: EXCEL_CELL_TEXT_LIMIT - 1] + "…"
 
 
-def _result_trace(result: StdsResult) -> str:
+def _result_trace_items(
+    result: Optional[StdsResult],
+    error: Optional[str] = None,
+    *,
+    prefix: str = "",
+) -> list:
+    label = (lambda value: f"{prefix}:{value}" if prefix else value)
+    if result is None:
+        return [(label("ERROR"), "", error or "未知错误")]
     if result.trace:
-        return serialize_trace(result.trace)
+        return [
+            (label(str(item[0])), item[1], item[2])
+            if isinstance(item, (list, tuple)) and len(item) >= 3
+            else (label("trace"), str(item), "")
+            for item in result.trace
+        ]
     if result.needs_review or result.source == Source.UNRESOLVED:
-        return serialize_trace(
-            [("UNRESOLVED", result.chartcode or "", "未能完成决策解析，需要人工复核")]
-        )
+        return [
+            (label("UNRESOLVED"), result.chartcode or "", "未能完成决策解析，需要人工复核")
+        ]
     if result.source == Source.MACHINE:
-        return serialize_trace(
-            [("T2_machine", "设备动作", "判定为设备动作，跳过人工标准时间计算")]
+        return [
+            (label("T2_machine"), "设备动作", "判定为设备动作，跳过人工标准时间计算")
+        ]
+    return []
+
+
+def _detail_trace(detail: ExcelDetailResult) -> str:
+    trace = [
+        (
+            "拆解",
+            detail.operation,
+            f"{detail.child_index}/{detail.child_count}; 主体={detail.split.actor}; 来源={detail.split.source}",
         )
-    return serialize_trace([])
+    ]
+    if detail.split.error:
+        trace.append(("拆解待复核", "回退为原动作", detail.split.error))
+    trace.extend(_result_trace_items(detail.result, detail.error))
+    return serialize_trace(trace)
 
 
 def _result_time(result: StdsResult) -> Optional[float]:
@@ -442,7 +612,82 @@ def _result_time(result: StdsResult) -> Optional[float]:
     return result.time_s
 
 
-def _write_results(workbook, layouts: dict[str, _SheetLayout], rows: list[ExcelRowResult]) -> bytes:
+def _unique_sheet_title(workbook, base: str) -> str:
+    if base not in workbook.sheetnames:
+        return base
+    index = 2
+    while f"{base}_{index}" in workbook.sheetnames:
+        index += 1
+    return f"{base}_{index}"
+
+
+def _write_detail_sheet(workbook, rows: list[ExcelRowResult]) -> str:
+    title = _unique_sheet_title(workbook, DETAIL_SHEET_BASE)
+    ws = workbook.create_sheet(title)
+    headers = [
+        "来源工作表",
+        "来源Excel行",
+        "number",
+        "station_op",
+        "原始operation",
+        "主体类型",
+        "拆解序号",
+        "拆解总数",
+        "拆解后operation",
+        "拆解来源",
+        "Chartcode",
+        DECISION_HEADER,
+        TRACE_HEADER,
+        TIME_HEADER,
+        "状态",
+    ]
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    for col, header in enumerate(headers, start=1):
+        cell = ws.cell(1, col, header)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    output_row = 2
+    for row in rows:
+        for detail in row.details:
+            values = [
+                detail.input_row.sheet_name,
+                detail.input_row.row_index,
+                detail.input_row.number,
+                detail.input_row.station_op,
+                detail.input_row.operation,
+                detail.split.actor,
+                detail.child_index,
+                detail.child_count,
+                detail.operation,
+                detail.split.source,
+                detail.result.chartcode if detail.result else "",
+                detail.result.decision if detail.result else "",
+                _detail_trace(detail),
+                detail.time_value(),
+                detail.status,
+            ]
+            for col, value in enumerate(values, start=1):
+                cell = ws.cell(output_row, col, value)
+                cell.alignment = Alignment(vertical="top", wrap_text=col in {5, 9, 12, 13})
+            ws.cell(output_row, headers.index(TIME_HEADER) + 1).number_format = "0.00"
+            output_row += 1
+
+    widths = [14, 12, 10, 16, 44, 12, 10, 10, 44, 14, 14, 30, 80, 12, 12]
+    for col, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(1, output_row - 1)}"
+    ws.row_dimensions[1].height = 24
+    return title
+
+
+def _write_results(
+    workbook,
+    layouts: dict[str, _SheetLayout],
+    rows: list[ExcelRowResult],
+) -> tuple[bytes, str]:
     for row in rows:
         ws = workbook[row.input_row.sheet_name]
         layout = layouts[row.input_row.sheet_name]
@@ -452,9 +697,9 @@ def _write_results(workbook, layouts: dict[str, _SheetLayout], rows: list[ExcelR
         operation_alignment.vertical = "top"
         operation_cell.alignment = operation_alignment
         values = {
-            DECISION_HEADER: row.result.decision if row.result else "",
-            TRACE_HEADER: _result_trace(row.result) if row.result else _error_trace(row.error),
-            TIME_HEADER: _result_time(row.result) if row.result else None,
+            DECISION_HEADER: row.decision_value(),
+            TRACE_HEADER: row.trace_value(),
+            TIME_HEADER: row.time_value(),
         }
         for header, value in values.items():
             cell = ws.cell(row.input_row.row_index, layout.result_cols[header])
@@ -482,9 +727,10 @@ def _write_results(workbook, layouts: dict[str, _SheetLayout], rows: list[ExcelR
             min(180, display_lines * 15),
         )
 
+    detail_sheet_name = _write_detail_sheet(workbook, rows)
     output = BytesIO()
     workbook.save(output)
-    return output.getvalue()
+    return output.getvalue(), detail_sheet_name
 
 
 def build_output_filename(source_name: str) -> str:
@@ -499,14 +745,13 @@ async def analyze_excel_bytes(
     deps: Deps,
     *,
     resolver: Resolver = resolve,
+    decomposer: Decomposer = decompose_operation,
     concurrency: Optional[int] = None,
     on_progress: Optional[ProgressCallback] = None,
 ) -> ExcelBatchOutput:
-    """解析所有含 operation 表头的工作表，并返回保留原内容的结果工作簿。"""
+    """先拆解 operation，再逐个子动作计算工时并回写完整审计结果。"""
     batch_started = time.perf_counter()
     workbook, layouts, input_rows = _load_inputs(excel_bytes)
-    total = len(input_rows)
-    completed = 0
     timings: list[ExcelProgress] = []
     sem = asyncio.Semaphore(max(1, concurrency or settings.CONCURRENCY_LIMIT))
 
@@ -524,57 +769,171 @@ async def analyze_excel_bytes(
     for input_row in input_rows:
         grouped_rows.setdefault(input_row.norm_key, []).append(input_row)
 
-    async def analyze_group(group: list[ExcelInputRow]) -> list[ExcelRowResult]:
-        nonlocal completed
+    # ---------- 阶段 1：主体判定 + Dify Prompt 拆解 ----------
+    decompose_started = time.perf_counter()
+    decompose_completed = 0
+
+    async def split_group(
+        norm_key: str,
+        group: list[ExcelInputRow],
+    ) -> tuple[str, OperationSplit]:
+        nonlocal decompose_completed
+        representative = group[0]
+        item_started: Optional[float] = None
+        split = OperationSplit(
+            actor="人工",
+            operations=(representative.operation,),
+            source="拆解失败回退",
+            needs_review=True,
+        )
+        try:
+            async with sem:
+                item_started = time.perf_counter()
+                split = await split_operation(
+                    representative.operation,
+                    deps,
+                    decomposer=decomposer,
+                )
+                return norm_key, split
+        except Exception as exc:
+            logger.exception(
+                "Excel operation decomposition failed: operation=%r rows=%s",
+                representative.operation,
+                [(input_row.sheet_name, input_row.row_index) for input_row in group],
+            )
+            error = f"{type(exc).__name__}: {exc}"
+            split = replace(split, error=error)
+            return norm_key, split
+        finally:
+            item_elapsed_s = (
+                time.perf_counter() - item_started if item_started is not None else 0.0
+            )
+            per_row_elapsed_s = item_elapsed_s / len(group)
+            for input_row in group:
+                decompose_completed += 1
+                progress = ExcelProgress(
+                    phase=PHASE_DECOMPOSE,
+                    completed_rows=decompose_completed,
+                    total_rows=len(input_rows),
+                    operation=input_row.operation,
+                    affected_rows=1,
+                    item_elapsed_s=per_row_elapsed_s,
+                    total_elapsed_s=time.perf_counter() - batch_started,
+                    generated_operations=split.operations,
+                    actor=split.actor,
+                    sheet_name=input_row.sheet_name,
+                    row_index=input_row.row_index,
+                )
+                timings.append(progress)
+                await notify_progress(progress)
+
+    split_pairs = await asyncio.gather(
+        *(
+            split_group(norm_key, group)
+            for norm_key, group in grouped_rows.items()
+        )
+    )
+    split_by_key = dict(split_pairs)
+    decompose_elapsed_s = time.perf_counter() - decompose_started
+
+    rows: list[ExcelRowResult] = []
+    for input_row in input_rows:
+        split = split_by_key[input_row.norm_key]
+        details = [
+            ExcelDetailResult(
+                input_row=input_row,
+                split=split,
+                child_index=index,
+                operation=operation,
+            )
+            for index, operation in enumerate(split.operations, start=1)
+        ]
+        rows.append(ExcelRowResult(input_row=input_row, split=split, details=details))
+
+    # ---------- 阶段 2：对拆解后的每个动作计算工时 ----------
+    detail_groups: dict[tuple[str, str], list[ExcelDetailResult]] = {}
+    for row in rows:
+        for detail in row.details:
+            norm_key = normalize(detail.operation) or detail.operation
+            detail_groups.setdefault((detail.split.actor, norm_key), []).append(detail)
+
+    analysis_started = time.perf_counter()
+    analysis_completed = 0
+    total_details = sum(len(group) for group in detail_groups.values())
+
+    async def analyze_group(group: list[ExcelDetailResult]) -> None:
+        nonlocal analysis_completed
         representative = group[0]
         item_started: Optional[float] = None
         try:
             async with sem:
                 item_started = time.perf_counter()
                 element = StdsElement(
-                    number=representative.number,
+                    number=representative.input_row.number,
                     operation_des=representative.operation,
-                    line_name=representative.line_name,
-                    station_op=representative.station_op,
+                    line_name=representative.input_row.line_name,
+                    station_op=representative.input_row.station_op,
                     freq=1.0,
-                    norm_key=representative.norm_key,
+                    norm_key=normalize(representative.operation) or representative.operation,
                 )
-                result = await resolver(element, deps)
-                return [ExcelRowResult(input_row=input_row, result=result) for input_row in group]
+                result = await resolve_with_actor(
+                    resolver,
+                    element,
+                    deps,
+                    representative.split.actor,
+                )
+
+                for detail in group:
+                    detail_element = StdsElement(
+                        number=detail.input_row.number,
+                        operation_des=detail.operation,
+                        line_name=detail.input_row.line_name,
+                        station_op=detail.input_row.station_op,
+                        freq=1.0,
+                        norm_key=normalize(detail.operation) or detail.operation,
+                    )
+                    detail.result = replace(result, element=detail_element)
         except Exception as exc:
             logger.exception(
-                "Excel operation failed: operation=%r rows=%s",
+                "Excel decomposed operation failed: operation=%r rows=%s",
                 representative.operation,
-                [(input_row.sheet_name, input_row.row_index) for input_row in group],
+                [
+                    (detail.input_row.sheet_name, detail.input_row.row_index)
+                    for detail in group
+                ],
             )
             error = f"{type(exc).__name__}: {exc}"
-            return [ExcelRowResult(input_row=input_row, error=error) for input_row in group]
+            for detail in group:
+                detail.error = error
         finally:
             item_elapsed_s = (
                 time.perf_counter() - item_started if item_started is not None else 0.0
             )
-            completed += len(group)
-            progress = ExcelProgress(
-                completed_rows=completed,
-                total_rows=total,
-                operation=representative.operation,
-                affected_rows=len(group),
-                item_elapsed_s=item_elapsed_s,
-                total_elapsed_s=time.perf_counter() - batch_started,
-            )
-            timings.append(progress)
-            await notify_progress(progress)
+            per_row_elapsed_s = item_elapsed_s / len(group)
+            for detail in group:
+                analysis_completed += 1
+                progress = ExcelProgress(
+                    phase=PHASE_ANALYZE,
+                    completed_rows=analysis_completed,
+                    total_rows=total_details,
+                    operation=detail.operation,
+                    affected_rows=1,
+                    item_elapsed_s=per_row_elapsed_s,
+                    total_elapsed_s=time.perf_counter() - batch_started,
+                    actor=detail.split.actor,
+                    sheet_name=detail.input_row.sheet_name,
+                    row_index=detail.input_row.row_index,
+                    child_index=detail.child_index,
+                    child_count=detail.child_count,
+                )
+                timings.append(progress)
+                await notify_progress(progress)
 
-    grouped_results = await asyncio.gather(
-        *(analyze_group(group) for group in grouped_rows.values())
+    await asyncio.gather(
+        *(analyze_group(group) for group in detail_groups.values())
     )
-    by_location = {
-        (row.input_row.sheet_name, row.input_row.row_index): row
-        for group_result in grouped_results
-        for row in group_result
-    }
-    rows = [by_location[(row.sheet_name, row.row_index)] for row in input_rows]
-    output_bytes = _write_results(workbook, layouts, rows)
+    analysis_elapsed_s = time.perf_counter() - analysis_started
+    output_bytes, detail_sheet_name = _write_results(workbook, layouts, rows)
     total_elapsed_s = time.perf_counter() - batch_started
     return ExcelBatchOutput(
         output_bytes=output_bytes,
@@ -582,4 +941,7 @@ async def analyze_excel_bytes(
         rows=rows,
         timings=timings,
         total_elapsed_s=total_elapsed_s,
+        decompose_elapsed_s=decompose_elapsed_s,
+        analysis_elapsed_s=analysis_elapsed_s,
+        detail_sheet_name=detail_sheet_name,
     )
