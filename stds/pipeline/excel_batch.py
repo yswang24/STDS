@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import time
+import unicodedata
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
@@ -318,8 +319,17 @@ class ExcelProgress:
 ProgressCallback = Callable[[ExcelProgress], object]
 
 
+def _clean_header(value: object) -> str:
+    """清理表头中的 BOM、零宽字符及各种空白，不做字段名称映射。"""
+    if value is None:
+        return ""
+    text = unicodedata.normalize("NFKC", str(value))
+    invisible = {"\ufeff", "\u200b", "\u200c", "\u200d", "\u2060"}
+    return "".join(char for char in text if not char.isspace() and char not in invisible)
+
+
 def _load_inputs(excel_bytes: bytes):
-    """按固定模板读取 数据表!A:C，不做表头搜索、别名或字段映射。"""
+    """清洗并校验 数据表!A:C，忽略后续列且不做字段名称映射。"""
     if not excel_bytes:
         raise ExcelInputError("上传的 Excel 文件为空")
     try:
@@ -333,18 +343,11 @@ def _load_inputs(excel_bytes: bytes):
 
     ws = workbook[INPUT_SHEET_NAME]
     values_ws = values_workbook[INPUT_SHEET_NAME]
-    actual_headers = tuple(ws.cell(1, col).value for col in range(1, 4))
+    actual_headers = tuple(_clean_header(ws.cell(1, col).value) for col in range(1, 4))
     if actual_headers != INPUT_HEADERS:
         raise ExcelInputError(
             "数据表第 1 行必须依次为：" + "、".join(INPUT_HEADERS)
         )
-    extra_headers = [
-        ws.cell(1, col).value
-        for col in range(4, ws.max_column + 1)
-        if ws.cell(1, col).value not in (None, "")
-    ]
-    if extra_headers:
-        raise ExcelInputError("数据表输入只允许三列：" + "、".join(INPUT_HEADERS))
 
     input_rows: list[ExcelInputRow] = []
     has_formula_operations = False

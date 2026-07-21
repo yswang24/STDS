@@ -87,7 +87,7 @@ st.caption(
 uploaded_file = st.file_uploader(
     "上传 Excel 文件",
     type=["xlsx"],
-    help="仅支持固定模板：数据表!A:C = 序号 / 工位号 / 操作内容",
+    help="读取数据表前三列：序号 / 工位号 / 操作内容；后续已有列会被忽略",
 )
 
 uploaded_bytes = uploaded_file.getvalue() if uploaded_file is not None else None

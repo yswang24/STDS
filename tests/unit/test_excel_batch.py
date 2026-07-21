@@ -214,10 +214,9 @@ def test_machine_operation_is_not_decomposed_and_outputs_na_analysis_fields():
     ("headers", "message"),
     [
         (["number", "station_op", "operation"], "必须依次为"),
-        (["序号", "工位号", " 操作内容 "], "必须依次为"),
     ],
 )
-def test_header_aliases_or_whitespace_are_not_mapped(headers, message):
+def test_header_aliases_are_not_mapped(headers, message):
     wb = Workbook()
     ws = wb.active
     ws.title = INPUT_SHEET_NAME
@@ -230,17 +229,58 @@ def test_header_aliases_or_whitespace_are_not_mapped(headers, message):
         asyncio.run(_analyze_excel_bytes(payload.getvalue(), "错误模板.xlsx", object()))
 
 
-def test_fourth_input_column_is_rejected():
+def test_header_hidden_characters_and_whitespace_are_cleaned():
+    async def fake_resolver(element, deps, *, machine_hint=None):
+        return _result(element)
+
     wb = Workbook()
     ws = wb.active
     ws.title = INPUT_SHEET_NAME
-    ws.append([*INPUT_HEADERS, "父记录"])
-    ws.append([1, "OP010", "人工拿取零件", None])
+    ws.append(["\ufeff 序\n号 ", "\u3000工位号\t", "\u200b操作 内容\u2060"])
+    ws.append([1, "OP010", "人工拿取零件"])
     payload = BytesIO()
     wb.save(payload)
 
-    with pytest.raises(ExcelInputError, match="只允许三列"):
-        asyncio.run(_analyze_excel_bytes(payload.getvalue(), "四列模板.xlsx", object()))
+    batch = asyncio.run(
+        _analyze_excel_bytes(
+            payload.getvalue(),
+            "隐藏字符模板.xlsx",
+            object(),
+            resolver=fake_resolver,
+        )
+    )
+    result_ws = load_workbook(BytesIO(batch.output_bytes))[INPUT_SHEET_NAME]
+    assert result_ws.cell(2, 1).value == 1
+    assert result_ws.cell(2, 2).value == "OP010"
+    assert result_ws.cell(2, 3).value == "人工拿取零件"
+
+
+def test_columns_after_first_three_are_ignored():
+    async def fake_resolver(element, deps, *, machine_hint=None):
+        return _result(element)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = INPUT_SHEET_NAME
+    ws.append([*INPUT_HEADERS, "决策描述", "动作代码", "增值/非增值(C/V)", "频率", "时间"])
+    ws.append([1, "OP010", "人工拿取零件", "旧决策", "旧代码", "C", 9, 99])
+    payload = BytesIO()
+    wb.save(payload)
+
+    batch = asyncio.run(
+        _analyze_excel_bytes(
+            payload.getvalue(),
+            "已有结果列.xlsx",
+            object(),
+            resolver=fake_resolver,
+        )
+    )
+    result_ws = load_workbook(BytesIO(batch.output_bytes))[INPUT_SHEET_NAME]
+    assert result_ws.cell(2, 3).value == "人工拿取零件"
+    assert result_ws.cell(2, 4).value == "T,90,NB"
+    assert result_ws.cell(2, 5).value == "202 010"
+    assert result_ws.cell(2, 7).value == 1.0
+    assert result_ws.cell(2, 8).value == 1.2
 
 
 def test_missing_number_or_station_is_rejected():
