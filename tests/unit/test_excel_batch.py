@@ -114,6 +114,8 @@ def test_fixed_template_is_flattened_to_exact_nine_columns():
     assert [ws.cell(row, 6).value for row in range(2, 7)] == ["V"] * 5
     assert [ws.cell(row, 7).value for row in range(2, 7)] == [1.0] * 5
     assert [ws.cell(row, 8).value for row in range(2, 7)] == [1.2] * 5
+    assert all(ws.cell(row, 7).number_format == "0.##" for row in range(2, 7))
+    assert all(ws.cell(row, 8).number_format == "0.00" for row in range(2, 7))
     assert all(json.loads(ws.cell(row, 9).value) for row in range(2, 7))
     assert ws.freeze_panes == "A2"
     assert ws.auto_filter.ref == "A1:I6"
@@ -156,7 +158,7 @@ def test_duplicate_operations_are_analyzed_once_but_each_source_row_is_output():
     assert [ws.cell(row, 2).value for row in (2, 3)] == ["OP010", "OP020"]
 
 
-def test_unresolved_row_has_empty_result_fields_and_explanatory_trace():
+def test_unresolved_row_has_na_result_fields_and_explanatory_trace():
     async def unresolved_resolver(element, deps, *, machine_hint=None):
         return StdsResult.unresolved(element, None)
 
@@ -171,16 +173,14 @@ def test_unresolved_row_has_empty_result_fields_and_explanatory_trace():
 
     assert batch.review_count == 1
     ws = load_workbook(BytesIO(batch.output_bytes))[INPUT_SHEET_NAME]
-    assert ws.cell(2, 4).value is None
-    assert ws.cell(2, 5).value is None
-    assert ws.cell(2, 8).value is None
+    assert [ws.cell(2, col).value for col in range(4, 9)] == ["NA"] * 5
     assert any(
         item["变量"].endswith("UNRESOLVED")
         for item in json.loads(ws.cell(2, 9).value)
     )
 
 
-def test_machine_operation_is_not_decomposed_and_outputs_zero_time():
+def test_machine_operation_is_not_decomposed_and_outputs_na_analysis_fields():
     decomposer_calls = 0
     hints = []
 
@@ -207,9 +207,7 @@ def test_machine_operation_is_not_decomposed_and_outputs_zero_time():
     assert hints == [True]
     ws = load_workbook(BytesIO(batch.output_bytes))[INPUT_SHEET_NAME]
     assert ws.cell(2, 3).value == "设备自动托盘进入"
-    assert ws.cell(2, 6).value == "V"
-    assert ws.cell(2, 7).value == 1.0
-    assert ws.cell(2, 8).value == 0.0
+    assert [ws.cell(2, col).value for col in range(4, 9)] == ["NA"] * 5
 
 
 @pytest.mark.parametrize(

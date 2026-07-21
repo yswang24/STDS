@@ -111,28 +111,44 @@ class ExcelDetailResult:
         }
 
     def as_preview(self) -> dict:
+        decision, chartcode, cv, freq, time_value = self.analysis_values()
         return {
             **self.as_decomposition_preview(),
-            CHARTCODE_HEADER: self.result.chartcode if self.result else "",
-            DECISION_HEADER: self.result.decision if self.result else "",
-            CV_HEADER: self.result.cv if self.result else "",
-            FREQ_HEADER: self.result.freq if self.result else None,
+            CHARTCODE_HEADER: chartcode,
+            DECISION_HEADER: decision,
+            CV_HEADER: cv,
+            FREQ_HEADER: freq,
             TRACE_HEADER: _detail_trace(self),
-            TIME_HEADER: self.time_value(),
+            TIME_HEADER: time_value,
             "状态": self.status,
         }
 
+    def analysis_values(self) -> tuple[object, object, object, object, object]:
+        """返回五个分析字段；无人工工时分析结果时统一输出 NA。"""
+        result = self.result
+        if result is None or result.source in {Source.MACHINE, Source.UNRESOLVED}:
+            return ("NA", "NA", "NA", "NA", "NA")
+        time_value = self.time_value()
+        return (
+            result.decision or "NA",
+            result.chartcode or "NA",
+            result.cv or "NA",
+            result.freq if result.freq is not None else "NA",
+            time_value if time_value is not None else "NA",
+        )
+
     def output_values(self) -> list:
         """返回固定九列输出；拆解子动作沿用原始序号和工位号。"""
+        decision, chartcode, cv, freq, time_value = self.analysis_values()
         return [
             self.input_row.number,
             self.input_row.station_op,
             self.operation,
-            self.result.decision if self.result else "",
-            self.result.chartcode if self.result else "",
-            self.result.cv if self.result else "",
-            self.result.freq if self.result else None,
-            self.time_value(),
+            decision,
+            chartcode,
+            cv,
+            freq,
+            time_value,
             _detail_trace(self),
         ]
 
@@ -493,7 +509,7 @@ def _write_results(workbook, rows: list[ExcelRowResult]) -> tuple[bytes, str]:
                     vertical="top",
                     wrap_text=col in {3, 4, 9},
                 )
-            ws.cell(output_row, OUTPUT_HEADERS.index(FREQ_HEADER) + 1).number_format = "0.00"
+            ws.cell(output_row, OUTPUT_HEADERS.index(FREQ_HEADER) + 1).number_format = "0.##"
             ws.cell(output_row, OUTPUT_HEADERS.index(TIME_HEADER) + 1).number_format = "0.00"
             trace_length = len(str(ws.cell(output_row, 9).value or ""))
             operation_length = len(str(ws.cell(output_row, 3).value or ""))
