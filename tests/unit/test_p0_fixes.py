@@ -66,11 +66,61 @@ def test_common_chart_short_keyword_rejected():
 
 def test_resolver_common_chart_fast_path():
     charts = load_charts()
-    deps = Deps(charts=charts, cache=AutoCache())
+    deps = Deps(charts=charts, cache=AutoCache(), use_common_chart=True)
     el = StdsElement(1, "转身90度", "L", "S", freq=1.0, norm_key="转身90度")
     res = asyncio.run(resolve(el, deps))
     assert res.source == Source.CACHE and res.chartcode == "202 010"
     assert any(step[0].startswith("V") for step in res.trace)
+
+
+def test_resolver_defaults_to_common_chart_disabled():
+    async def no_chartcode(operation, charts):
+        return None
+
+    charts = load_charts()
+    deps = Deps(
+        charts=charts,
+        cache=AutoCache(),
+        llm_select_chartcode=no_chartcode,
+    )
+    el = StdsElement(1, "转身90度", "L", "S", freq=1.0, norm_key="转身90度")
+    res = asyncio.run(resolve(el, deps))
+
+    assert deps.common_rows == []
+    assert res.source == Source.UNRESOLVED
+    assert not any(
+        isinstance(step, (list, tuple))
+        and step
+        and str(step[0]).startswith("T0.5_common")
+        for step in res.trace
+    )
+
+
+def test_disabling_common_chart_skips_its_existing_t0_cache():
+    async def no_chartcode(operation, charts):
+        return None
+
+    charts = load_charts()
+    cache = AutoCache()
+    el = StdsElement(1, "转身90度", "L", "S", freq=1.0, norm_key="转身90度")
+
+    enabled_result = asyncio.run(
+        resolve(el, Deps(charts=charts, cache=cache, use_common_chart=True))
+    )
+    disabled_result = asyncio.run(
+        resolve(
+            el,
+            Deps(
+                charts=charts,
+                cache=cache,
+                use_common_chart=False,
+                llm_select_chartcode=no_chartcode,
+            ),
+        )
+    )
+
+    assert enabled_result.source == Source.CACHE
+    assert disabled_result.source == Source.UNRESOLVED
 
 
 # ---------- #3 T1 seed from common_chart ----------
@@ -99,6 +149,34 @@ def test_api_jobs_endpoint_async():
     resp = client.post("/jobs", json={"line_name": "L", "station_op": "S"})
     assert resp.status_code == 200
     assert "job_id" in resp.json()
+    assert resp.json()["use_common_chart"] is False
+
+
+def test_api_jobs_forwards_common_chart_switch(monkeypatch):
+    from fastapi.testclient import TestClient
+    from stds.api import main
+
+    captured = {}
+    original_get_deps = main._get_deps
+
+    def capture_get_deps(*, use_common_chart=False):
+        captured["use_common_chart"] = use_common_chart
+        return original_get_deps(use_common_chart=use_common_chart)
+
+    monkeypatch.setattr(main, "_get_deps", capture_get_deps)
+    client = TestClient(main.create_app())
+    resp = client.post(
+        "/jobs",
+        json={
+            "line_name": "L",
+            "station_op": "S",
+            "use_common_chart": False,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["use_common_chart"] is False
+    assert captured["use_common_chart"] is False
 
 
 # ---------- #6 LLM default bias ----------

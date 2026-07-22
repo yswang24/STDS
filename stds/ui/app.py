@@ -28,7 +28,8 @@ from stds.pipeline.excel_batch import ExcelInputError, ExcelProgress, analyze_ex
 from stds.pipeline.operation_analysis import OperationAnalysis, analyze_operation
 from stds.review.flywheel import on_review_confirmed
 
-BATCH_OUTPUT_SCHEMA_VERSION = 2
+BATCH_OUTPUT_SCHEMA_VERSION = 4
+COMMON_CHART_SETTING_VERSION = 1
 
 # ---------- 初始化(缓存到 session_state) ----------
 if "charts" not in st.session_state:
@@ -44,6 +45,9 @@ if st.session_state.get("batch_output_schema_version") != BATCH_OUTPUT_SCHEMA_VE
 if "single_output" not in st.session_state:
     st.session_state.single_output = None
     st.session_state.single_run_id = 0
+if st.session_state.get("common_chart_setting_version") != COMMON_CHART_SETTING_VERSION:
+    st.session_state.use_common_chart = False
+    st.session_state.common_chart_setting_version = COMMON_CHART_SETTING_VERSION
 
 PROMPTS_DIR = Path(__file__).parent.parent / "llm" / "prompts"
 
@@ -58,6 +62,15 @@ with st.sidebar:
     st.text(f"Backend: {settings.LLM_BACKEND}")
     st.text(f"Model: {settings.CUSTOM_LLM_MODEL or settings.LLM_MODEL}")
     st.text(f"并发: {settings.CONCURRENCY_LIMIT}")
+    use_common_chart = st.toggle(
+        "启用 T0.5 Common Chart",
+        value=False,
+        key="use_common_chart",
+        help=(
+            "开启时优先使用 common_chart 的高频动作快速匹配；"
+            "关闭时跳过 T0.5，继续使用后续 kNN/LLM 工时分析。"
+        ),
+    )
 
     st.divider()
     st.subheader("📝 Prompt 编辑(热更新)")
@@ -154,6 +167,7 @@ if batch_submitted and uploaded_file is not None:
             charts=st.session_state.charts,
             cache=st.session_state.cache,
             common_rows=st.session_state.common_rows,
+            use_common_chart=use_common_chart,
             llm_pick_value=pick_value,
         )
         batch_result = asyncio.run(
@@ -182,6 +196,7 @@ if batch_submitted and uploaded_file is not None:
             "average_elapsed_s": batch_result.average_elapsed_s,
             "timings": batch_result.timing_rows(),
             "detail_sheet_name": batch_result.detail_sheet_name,
+            "use_common_chart": use_common_chart,
         }
     except ExcelInputError as exc:
         st.session_state.batch_output = None
@@ -200,6 +215,7 @@ if (
     uploaded_file is not None
     and batch_output is not None
     and batch_output["source_digest"] == uploaded_digest
+    and batch_output["use_common_chart"] == use_common_chart
 ):
     if batch_output["failed"] or batch_output["review"]:
         st.warning(
@@ -257,6 +273,16 @@ if (
     with st.expander("📊 原始 Excel 行汇总", expanded=False):
         st.dataframe(batch_output["preview"], hide_index=True, width="stretch")
     st.caption(f"下载结果中的逐条拆解与工时明细位于“{batch_output['detail_sheet_name']}”工作表。")
+    st.caption(
+        "本次分析的 T0.5 Common Chart："
+        f"{'已启用' if batch_output['use_common_chart'] else '已关闭'}"
+    )
+elif (
+    uploaded_file is not None
+    and batch_output is not None
+    and batch_output["source_digest"] == uploaded_digest
+):
+    st.info("T0.5 Common Chart 设置已变化，请重新点击“开始批量分析”。")
 
 st.divider()
 st.subheader("✍️ 单条分析（可选）")
@@ -336,7 +362,13 @@ if analyze_submitted and operation.strip():
             )
 
         async def do_analyze():
-            deps = Deps(charts=charts, cache=cache, common_rows=common_rows, llm_pick_value=pick_value)
+            deps = Deps(
+                charts=charts,
+                cache=cache,
+                common_rows=common_rows,
+                use_common_chart=use_common_chart,
+                llm_pick_value=pick_value,
+            )
             return await analyze_operation(
                 operation.strip(),
                 deps,
@@ -352,6 +384,7 @@ if analyze_submitted and operation.strip():
         st.session_state.single_output = {
             "run_id": st.session_state.single_run_id,
             "analysis": single_analysis,
+            "use_common_chart": use_common_chart,
         }
         status_state = "complete" if single_analysis.status == "成功" else "error"
         single_status.update(
@@ -371,6 +404,7 @@ single_output = st.session_state.single_output
 if single_output is not None:
     single_analysis: OperationAnalysis = single_output["analysis"]
     single_run_id = single_output["run_id"]
+    single_use_common_chart = single_output.get("use_common_chart", False)
     st.divider()
     st.subheader("📋 单条分析结果")
 
@@ -387,7 +421,8 @@ if single_output is not None:
     st.caption(
         f"拆解阶段 {single_analysis.decompose_elapsed_s:.2f} 秒｜"
         f"工时分析阶段 {single_analysis.analysis_elapsed_s:.2f} 秒｜"
-        f"状态：{single_analysis.status}"
+        f"状态：{single_analysis.status}｜T0.5 Common Chart："
+        f"{'已启用' if single_use_common_chart else '已关闭'}"
     )
 
     if single_analysis.split.error:

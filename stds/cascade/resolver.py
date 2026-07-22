@@ -1,4 +1,4 @@
-"""廉价优先级联主入口:串联 T0->T5,含 T0.5 common_chart + T1 kNN + T3 LLM 定码。"""
+"""廉价优先级联主入口:串联 T0->T5，可配置 T0.5 common_chart。"""
 from __future__ import annotations
 
 import asyncio
@@ -24,6 +24,7 @@ class Deps:
     charts: dict                           # {chartcode: MostChart}
     cache: object                          # AutoCache
     common_rows: list = None               # T0.5 common_chart 33 条
+    use_common_chart: bool = False          # 是否启用 T0.5 快速路径（默认关闭）
     llm_classify: Callable = None          # async (text) -> bool(设备=True)
     llm_select_chartcode: Callable = None  # async (op_des, charts) -> chartcode or None
     llm_pick_value: Callable = None        # async (op_des, cands) -> (VOption, conf, reason)
@@ -37,7 +38,7 @@ class Deps:
         if self.llm_select_chartcode is None:
             self.llm_select_chartcode = _default_select_chartcode
         if self.common_rows is None:
-            self.common_rows = load_common_chart()
+            self.common_rows = load_common_chart() if self.use_common_chart else []
 
 
 def _put_cache_template(el: StdsElement, result: StdsResult, deps: Deps, unit_time: float) -> None:
@@ -46,6 +47,20 @@ def _put_cache_template(el: StdsElement, result: StdsResult, deps: Deps, unit_ti
         el.norm_key,
         replace(result, time_s=unit_time, freq=1.0),
     )
+
+
+def _is_common_chart_result(result: StdsResult) -> bool:
+    """识别由 T0.5 写入的缓存，保证关闭开关后不会从 T0 间接命中。"""
+    for step in result.trace or []:
+        if isinstance(step, dict):
+            variable = step.get("变量", step.get("variable", step.get("step", "")))
+        elif isinstance(step, (list, tuple)) and step:
+            variable = step[0]
+        else:
+            variable = ""
+        if str(variable).startswith("T0.5_common"):
+            return True
+    return False
 
 
 async def resolve(
@@ -66,7 +81,12 @@ async def resolve(
 
     # T0 精确缓存
     cached = deps.cache.get(el.norm_key)
-    if cached is not None:
+    common_cache_disabled = (
+        cached is not None
+        and not deps.use_common_chart
+        and _is_common_chart_result(cached)
+    )
+    if cached is not None and not common_cache_disabled:
         logger.info(f"  [T0] 缓存命中: {cached.chartcode} / {cached.time_s}s")
         # 新缓存恒为 freq=1；兼容当前进程里热更新前留下的旧缓存对象。
         time_single = cached.time_s if cached.freq == 1.0 else cached.time_s / (cached.freq or 1.0)
@@ -76,10 +96,19 @@ async def resolve(
             time_s=round(time_single * el.freq, 2),
             freq=el.freq,
         )
-    logger.debug(f"  [T0] 缓存未命中")
+    if common_cache_disabled:
+        logger.info("  [T0] 跳过由 T0.5 产生的缓存（Common Chart 已关闭）")
+    else:
+        logger.debug(f"  [T0] 缓存未命中")
 
     # T0.5 common_chart 关键词匹配(33 条高频动作,零 LLM)
-    cc_hit = match_common_chart(op, deps.common_rows)
+    cc_hit = (
+        match_common_chart(op, deps.common_rows)
+        if deps.use_common_chart
+        else None
+    )
+    if not deps.use_common_chart:
+        logger.info("  [T0.5] Common Chart 已关闭，跳过")
     if cc_hit and cc_hit.chartcode in deps.charts:
         chart = deps.charts[cc_hit.chartcode]
         try:

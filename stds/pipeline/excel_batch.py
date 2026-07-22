@@ -10,7 +10,7 @@ import unicodedata
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -21,6 +21,10 @@ from stds.cascade.rules import normalize
 from stds.config.settings import settings
 from stds.domain.models import Source, StdsElement, StdsResult
 from stds.llm.decompose import decompose_operation
+from stds.llm.translate_operation import (
+    contains_latin_letters,
+    translate_operation_for_output,
+)
 from stds.pipeline.operation_analysis import (
     Decomposer,
     OperationSplit,
@@ -88,6 +92,7 @@ class ExcelDetailResult:
     split: OperationSplit
     child_index: int
     operation: str
+    display_operation: Optional[str] = None
     result: Optional[StdsResult] = None
     error: Optional[str] = None
 
@@ -152,7 +157,7 @@ class ExcelDetailResult:
         return [
             self.input_row.number,
             self.input_row.station_op,
-            self.operation,
+            self.output_operation,
             decision,
             chartcode,
             cv,
@@ -160,6 +165,11 @@ class ExcelDetailResult:
             time_value,
             _detail_trace(self),
         ]
+
+    @property
+    def output_operation(self) -> str:
+        """最终展示文本；分析、检索和 trace 仍保留拆解后的原文。"""
+        return self.display_operation or self.operation
 
     def output_row(self) -> dict:
         """前端明细与下载工作簿共用的固定九列记录。"""
@@ -329,6 +339,7 @@ class ExcelProgress:
 
 
 ProgressCallback = Callable[[ExcelProgress], object]
+OutputTranslator = Callable[[str], Awaitable[str]]
 
 
 def _clean_header(value: object) -> str:
@@ -506,6 +517,46 @@ def _result_time(result: StdsResult) -> Optional[float]:
     return result.time_s
 
 
+async def _translate_output_operations(
+    rows: list[ExcelRowResult],
+    translator: OutputTranslator,
+    sem: asyncio.Semaphore,
+) -> None:
+    """在最终展示前按原文去重翻译；失败只回退展示原文，不影响分析结果。"""
+    grouped_details: dict[str, list[ExcelDetailResult]] = {}
+    for row in rows:
+        for detail in row.details:
+            if contains_latin_letters(detail.operation):
+                grouped_details.setdefault(detail.operation, []).append(detail)
+
+    async def translate_group(
+        operation: str,
+        details: list[ExcelDetailResult],
+    ) -> None:
+        translated = operation
+        try:
+            async with sem:
+                candidate = str(await translator(operation)).strip()
+            if not candidate:
+                raise ValueError("翻译后的操作内容为空")
+            translated = candidate
+        except Exception:
+            logger.warning(
+                "Output operation translation failed; keeping original: operation=%r",
+                operation,
+                exc_info=True,
+            )
+        for detail in details:
+            detail.display_operation = translated
+
+    await asyncio.gather(
+        *(
+            translate_group(operation, details)
+            for operation, details in grouped_details.items()
+        )
+    )
+
+
 def _write_results(workbook, rows: list[ExcelRowResult]) -> tuple[bytes, str]:
     """将 数据表 重写为固定九列的逐条拆解结果。"""
     ws = workbook[INPUT_SHEET_NAME]
@@ -569,6 +620,7 @@ async def analyze_excel_bytes(
     *,
     resolver: Resolver = resolve,
     decomposer: Decomposer = decompose_operation,
+    translator: OutputTranslator = translate_operation_for_output,
     concurrency: Optional[int] = None,
     on_progress: Optional[ProgressCallback] = None,
 ) -> ExcelBatchOutput:
@@ -756,6 +808,8 @@ async def analyze_excel_bytes(
         *(analyze_group(group) for group in detail_groups.values())
     )
     analysis_elapsed_s = time.perf_counter() - analysis_started
+    # 最终展示阶段才翻译，确保工时分析始终使用原始拆解动作。
+    await _translate_output_operations(rows, translator, sem)
     output_bytes, detail_sheet_name = _write_results(workbook, rows)
     total_elapsed_s = time.perf_counter() - batch_started
     return ExcelBatchOutput(

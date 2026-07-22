@@ -154,6 +154,14 @@ class _MockLLM:
             return schema(index=self._default_index, reason="mock")
         if "auto" in fields:
             return schema(auto=0)
+        if "translated_operation" in fields:
+            marker = "待处理操作内容："
+            operation = (
+                prompt.split(marker, 1)[1].split("\n", 1)[0].strip()
+                if marker in prompt
+                else ""
+            )
+            return schema(translated_operation=operation)
         if "operation" in fields:
             marker = "用户输入:"
             operation = prompt.split(marker, 1)[1].split("\n", 1)[0].strip() if marker in prompt else "mock operation"

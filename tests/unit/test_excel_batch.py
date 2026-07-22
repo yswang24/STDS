@@ -169,6 +169,89 @@ def test_duplicate_operations_are_analyzed_once_but_each_source_row_is_output():
     assert [ws.cell(row, 2).value for row in (2, 3)] == ["OP010", "OP020"]
 
 
+def test_final_operation_column_is_translated_without_changing_analysis_input():
+    translated_inputs = []
+    analyzed_inputs = []
+
+    async def fake_decomposer(operation):
+        return [
+            "Manual pick up Front End Module",
+            "操作人员 install ECU bracket",
+            "操作人员拿取中文零件",
+        ]
+
+    async def fake_translator(operation):
+        translated_inputs.append(operation)
+        return {
+            "Manual pick up Front End Module": "操作人员拿取 Front End Module",
+            "操作人员 install ECU bracket": "操作人员安装 ECU bracket",
+        }[operation]
+
+    async def fake_resolver(element, deps, *, machine_hint=None):
+        analyzed_inputs.append(element.operation_des)
+        return _result(element)
+
+    batch = asyncio.run(
+        analyze_excel_bytes(
+            _workbook_bytes([[1, "OP010", "Manual assemble module"]]),
+            "中英混合.xlsx",
+            object(),
+            resolver=fake_resolver,
+            decomposer=fake_decomposer,
+            translator=fake_translator,
+        )
+    )
+
+    expected_output = [
+        "操作人员拿取 Front End Module",
+        "操作人员安装 ECU bracket",
+        "操作人员拿取中文零件",
+    ]
+    assert analyzed_inputs == [
+        "Manual pick up Front End Module",
+        "操作人员 install ECU bracket",
+        "操作人员拿取中文零件",
+    ]
+    assert sorted(translated_inputs) == sorted(analyzed_inputs[:2])
+    assert [detail.operation for detail in batch.rows[0].details] == analyzed_inputs
+    assert [row["操作内容"] for row in batch.detail_preview_rows()] == expected_output
+    ws = load_workbook(BytesIO(batch.output_bytes))[INPUT_SHEET_NAME]
+    assert [ws.cell(row, 3).value for row in range(2, 5)] == expected_output
+
+
+def test_output_translation_is_deduplicated_and_failure_falls_back_to_original():
+    translator_calls = 0
+
+    async def fake_translator(operation):
+        nonlocal translator_calls
+        translator_calls += 1
+        raise RuntimeError("translation service unavailable")
+
+    async def fake_resolver(element, deps, *, machine_hint=None):
+        return _result(element)
+
+    batch = asyncio.run(
+        _analyze_excel_bytes(
+            _workbook_bytes(
+                [
+                    [1, "OP010", "Manual pick part"],
+                    [2, "OP020", "Manual pick part"],
+                ]
+            ),
+            "翻译回退.xlsx",
+            object(),
+            resolver=fake_resolver,
+            translator=fake_translator,
+        )
+    )
+
+    assert translator_calls == 1
+    assert [row["操作内容"] for row in batch.detail_preview_rows()] == [
+        "Manual pick part",
+        "Manual pick part",
+    ]
+
+
 def test_unresolved_row_has_na_result_fields_and_explanatory_trace():
     async def unresolved_resolver(element, deps, *, machine_hint=None):
         return StdsResult.unresolved(element, None)

@@ -34,19 +34,32 @@ _charts = load_charts()
 _cache = AutoCache()
 
 
-def _get_deps() -> Deps:
-    return Deps(charts=_charts, cache=_cache)
+def _get_deps(*, use_common_chart: bool = False) -> Deps:
+    return Deps(
+        charts=_charts,
+        cache=_cache,
+        use_common_chart=use_common_chart,
+    )
+
+
+class JobRequest(BaseModel):
+    line_name: str = ""
+    station_op: str = ""
+    use_common_chart: bool = False
 
 
 @api.post("/jobs")
-async def start_job(req: dict):
+async def start_job(req: JobRequest):
     """启动整工位任务。用 asyncio.create_task 在同一事件循环里运行,确保 SSE 能推到。"""
-    line = req.get("line_name", "")
-    station = req.get("station_op", "")
+    line = req.line_name
+    station = req.station_op
     job_id = str(uuid.uuid4())[:8]
-    deps = _get_deps()
+    deps = _get_deps(use_common_chart=req.use_common_chart)
     asyncio.create_task(run_station(line, station, job_id, deps, _state))
-    return {"job_id": job_id}
+    return {
+        "job_id": job_id,
+        "use_common_chart": req.use_common_chart,
+    }
 
 
 @api.get("/jobs/{job_id}/stream")
