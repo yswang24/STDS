@@ -257,6 +257,31 @@ def test_output_translation_is_deduplicated_and_failure_falls_back_to_original()
     ]
 
 
+def test_auto_machine_translation_failure_still_uses_chinese_auto_prefix():
+    async def fake_translator(operation):
+        raise RuntimeError("translation service unavailable")
+
+    async def machine_resolver(element, deps, *, machine_hint=None):
+        assert machine_hint is True
+        return StdsResult.machine_placeholder(element)
+
+    batch = asyncio.run(
+        _analyze_excel_bytes(
+            _workbook_bytes([[1, "OP010", "Auto Robot Load CTR to pallet"]]),
+            "设备英文.xlsx",
+            object(),
+            resolver=machine_resolver,
+            translator=fake_translator,
+        )
+    )
+
+    assert batch.detail_preview_rows()[0]["操作内容"] == (
+        "自动 Robot Load CTR to pallet"
+    )
+    ws = load_workbook(BytesIO(batch.output_bytes))[INPUT_SHEET_NAME]
+    assert ws.cell(2, 3).value == "自动 Robot Load CTR to pallet"
+
+
 def test_unresolved_row_has_na_result_fields_and_explanatory_trace():
     async def unresolved_resolver(element, deps, *, machine_hint=None):
         return StdsResult.unresolved(element, None)

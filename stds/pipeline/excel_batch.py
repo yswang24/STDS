@@ -23,6 +23,7 @@ from stds.domain.models import Source, StdsElement, StdsResult
 from stds.llm.decompose import decompose_operation
 from stds.llm.translate_operation import (
     contains_latin_letters,
+    normalize_auto_output_prefix,
     translate_operation_for_output,
 )
 from stds.pipeline.operation_analysis import (
@@ -531,7 +532,8 @@ async def _translate_output_operations(
         operation: str,
         details: list[ExcelDetailResult],
     ) -> None:
-        translated = operation
+        # 即使翻译服务失败，也保证 Auto 设备动作的最终展示以“自动”开头。
+        translated = normalize_auto_output_prefix(operation, operation)
         try:
             async with sem:
                 candidate = str(await translator(operation)).strip()

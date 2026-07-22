@@ -10,6 +10,8 @@ from stds.llm.prompts import load_prompt
 
 TRANSLATE_INPUT_PLACEHOLDER = "{{#operation#}}"
 _LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
+_AUTO_SOURCE_PREFIX_RE = re.compile(r"^\s*auto\b[\s:：_-]*", re.IGNORECASE)
+_AUTO_TRANSLATED_PREFIX_RE = re.compile(r"^\s*(?:设备\s*)?自动[\s:：_-]*")
 
 
 class TranslateOperationOut(BaseModel):
@@ -29,6 +31,20 @@ def contains_latin_letters(operation: str) -> bool:
     return _LATIN_LETTER_RE.search(str(operation)) is not None
 
 
+def normalize_auto_output_prefix(source: str, translated: str) -> str:
+    """Auto 开头的设备动作在最终展示中强制以“自动”开头。"""
+    cleaned = str(translated).strip()
+    if not _AUTO_SOURCE_PREFIX_RE.search(str(source)):
+        return cleaned
+
+    translated_body = _AUTO_TRANSLATED_PREFIX_RE.sub("", cleaned, count=1)
+    if translated_body == cleaned:
+        translated_body = _AUTO_SOURCE_PREFIX_RE.sub("", cleaned, count=1)
+    translated_body = translated_body.lstrip()
+    separator = " " if translated_body[:1].isascii() and translated_body[:1].isalpha() else ""
+    return f"自动{separator}{translated_body}"
+
+
 def build_translate_operation_prompt(operation: str) -> str:
     template = load_prompt("translate_operation")
     if TRANSLATE_INPUT_PLACEHOLDER not in template:
@@ -45,4 +61,4 @@ async def translate_operation_for_output(operation: str) -> str:
         build_translate_operation_prompt(cleaned),
         TranslateOperationOut,
     )
-    return out.translated_operation
+    return normalize_auto_output_prefix(cleaned, out.translated_operation)
