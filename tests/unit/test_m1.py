@@ -43,6 +43,9 @@ def test_rule_machine():
     assert rule_machine("拿取泡棉") is False
     assert rule_machine("转身并弯腰") is False
     assert rule_machine("操作人员移动吊具") is False  # 人工优先
+    assert rule_machine("Manual install CTR") is False
+    assert rule_machine("Auto IPV snap ring seated") is True
+    assert rule_machine("Auto Robot Load CTR to pallet") is True
     assert rule_machine("未知操作") is None  # 歧义,需 LLM
 
 

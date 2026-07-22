@@ -32,6 +32,8 @@ _HUMAN_KEYWORDS = [
     "取出", "放置", "组装", "拧紧", "检查", "擦拭", "扣合", "卡入", "插接",
     "移动", "搬运", "使用", "手持",
 ]
+_ENGLISH_HUMAN_RE = re.compile(r"\bmanual(?:ly)?\b", re.IGNORECASE)
+_ENGLISH_MACHINE_RE = re.compile(r"\bauto(?:matic(?:ally)?)?\b", re.IGNORECASE)
 
 
 def rule_machine(text: str):
@@ -39,11 +41,11 @@ def rule_machine(text: str):
 
     优先级:人工优先关键词 > 设备关键词 > 人工动作关键词 > None
     """
-    # 1. 人工优先("操作人员移动吊具" → 人工,即使含"吊具")
-    if any(k in text for k in _HUMAN_PRIORITY):
+    # 1. 人工优先("操作人员移动吊具" / "Manual install" → 人工)
+    if any(k in text for k in _HUMAN_PRIORITY) or _ENGLISH_HUMAN_RE.search(text):
         return False
-    # 2. 设备("自动扫码"、"AGV自动传送" → 设备)
-    if any(k in text for k in _MACHINE_KEYWORDS):
+    # 2. 设备("自动扫码" / "Auto IPV" / "Auto Robot" → 设备)
+    if any(k in text for k in _MACHINE_KEYWORDS) or _ENGLISH_MACHINE_RE.search(text):
         return True
     # 3. 人工动作("拿取"、"转身" → 人工)
     if any(k in text for k in _HUMAN_KEYWORDS):

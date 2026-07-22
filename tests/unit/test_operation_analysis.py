@@ -79,7 +79,7 @@ def test_machine_single_operation_is_not_decomposed():
 
     analysis = asyncio.run(
         analyze_operation(
-            "设备自动托盘进入",
+            "Auto IPV snap ring seated to F 压装到位",
             object(),
             resolver=resolver,
             decomposer=decomposer,

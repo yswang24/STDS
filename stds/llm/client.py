@@ -28,6 +28,9 @@ class LLMError(Exception):
 
 
 SUPPORTED_LLM_BACKENDS = frozenset({"auto", "vllm", "custom", "ollama", "mock"})
+OLLAMA_SYSTEM_EXECUTION_PROMPT = (
+    "请严格执行 system 中的任务，并且只输出符合指定 JSON Schema 的 JSON。"
+)
 
 
 @dataclass(frozen=True)
@@ -385,7 +388,11 @@ class _OllamaClient:
             try:
                 payload = {
                     "model": model,
-                    "prompt": "" if exact_system_prompt else full_prompt,
+                    "prompt": (
+                        OLLAMA_SYSTEM_EXECUTION_PROMPT
+                        if exact_system_prompt
+                        else full_prompt
+                    ),
                     "format": schema.model_json_schema(),
                     "stream": False,
                     "options": {"temperature": 0.1},
@@ -398,10 +405,24 @@ class _OllamaClient:
                     timeout=120,
                 )
                 response_data = r.json()
+                if not isinstance(response_data, dict):
+                    raise ValueError(
+                        "Ollama 响应顶层不是 JSON object: "
+                        f"{type(response_data).__name__}"
+                    )
                 if r.status_code >= 400 or response_data.get("error"):
                     message = response_data.get("error") or f"HTTP {r.status_code}"
                     raise _LLMResponseError(r.status_code, f"Ollama: {message}")
-                data = _json_from_content(response_data["response"])
+                response_content = response_data.get("response")
+                if not isinstance(response_content, str) or not response_content.strip():
+                    thinking = response_data.get("thinking") or ""
+                    raise ValueError(
+                        "Ollama 返回空 response: "
+                        f"model={model}, "
+                        f"done_reason={response_data.get('done_reason') or 'unknown'}, "
+                        f"thinking_chars={len(str(thinking))}"
+                    )
+                data = _json_from_content(response_content)
                 return schema.model_validate(data)
             except Exception as exc:
                 last = exc

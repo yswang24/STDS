@@ -14,6 +14,7 @@ from stds.llm.decompose import (
 )
 from stds.llm.client import (
     LLMError,
+    OLLAMA_SYSTEM_EXECUTION_PROMPT,
     _OllamaClient,
     _OpenAIClient,
     get_llm_runtime_options,
@@ -247,9 +248,41 @@ def test_ollama_runtime_override_applies_to_system_prompt(monkeypatch):
     assert result.operation == ["操作人员拿取零件"]
     assert captured["url"] == "http://127.0.0.1:11435/api/generate"
     assert captured["model"] == "gemma3:4b"
-    assert captured["prompt"] == ""
+    assert captured["prompt"] == OLLAMA_SYSTEM_EXECUTION_PROMPT
     assert captured["system"] == "完整系统提示"
     assert get_llm_runtime_options().backend is None
+
+
+def test_ollama_empty_response_has_actionable_error(monkeypatch):
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "model": "qwen3:8b",
+                "response": "",
+                "thinking": "正在分析",
+                "done_reason": "stop",
+            }
+
+    monkeypatch.setattr(
+        "stds.llm.client.httpx.post",
+        lambda *args, **kwargs: Response(),
+    )
+    client = _OllamaClient("http://localhost:11434", "qwen3:8b")
+
+    with pytest.raises(
+        LLMError,
+        match=r"空 response.*qwen3:8b.*done_reason=stop.*thinking_chars=4",
+    ):
+        asyncio.run(
+            client.structured(
+                "完整系统提示",
+                DecomposeOut,
+                retries=0,
+                exact_system_prompt=True,
+            )
+        )
 
 
 def test_ollama_runtime_rejects_invalid_base_url():
