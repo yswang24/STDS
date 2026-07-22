@@ -23,12 +23,13 @@ from stds.cascade.resolver import Deps
 from stds.data.cache import AutoCache
 from stds.data.charts_loader import load_charts
 from stds.data.common_chart import load_common_chart
+from stds.llm.client import llm_runtime
 from stds.llm.pick_value import pick_value
 from stds.pipeline.excel_batch import ExcelInputError, ExcelProgress, analyze_excel_bytes
 from stds.pipeline.operation_analysis import OperationAnalysis, analyze_operation
 from stds.review.flywheel import on_review_confirmed
 
-BATCH_OUTPUT_SCHEMA_VERSION = 4
+BATCH_OUTPUT_SCHEMA_VERSION = 5
 COMMON_CHART_SETTING_VERSION = 1
 
 # ---------- 初始化(缓存到 session_state) ----------
@@ -59,8 +60,38 @@ with st.sidebar:
 
     st.subheader("LLM 配置")
     from stds.config.settings import settings
-    st.text(f"Backend: {settings.LLM_BACKEND}")
-    st.text(f"Model: {settings.CUSTOM_LLM_MODEL or settings.LLM_MODEL}")
+    llm_mode_options = ("configured", "ollama")
+    llm_mode = st.selectbox(
+        "LLM 后端",
+        llm_mode_options,
+        index=1 if settings.LLM_BACKEND.lower() == "ollama" else 0,
+        format_func=lambda value: (
+            f"环境配置（{settings.LLM_BACKEND}）"
+            if value == "configured"
+            else "Ollama"
+        ),
+        key="llm_mode",
+    )
+    if llm_mode == "ollama":
+        ollama_base_url = st.text_input(
+            "Ollama 地址",
+            value=settings.OLLAMA_BASE,
+            key="ollama_base_url",
+        ).strip()
+        ollama_model = st.text_input(
+            "Ollama 模型",
+            value=settings.OLLAMA_LLM_MODEL,
+            help="填写本机已通过 ollama pull 安装的模型名，例如 qwen3:14b。",
+            key="ollama_model",
+        ).strip()
+        llm_backend_override = "ollama"
+        llm_model_override = ollama_model
+    else:
+        ollama_base_url = None
+        ollama_model = None
+        llm_backend_override = None
+        llm_model_override = None
+        st.caption("当前模型由 .env 中的 LLM_BACKEND 及对应模型配置决定。")
     st.text(f"并发: {settings.CONCURRENCY_LIMIT}")
     use_common_chart = st.toggle(
         "启用 T0.5 Common Chart",
@@ -89,6 +120,12 @@ with st.sidebar:
     st.subheader("📊 统计")
     st.text(f"缓存命中: {len(st.session_state.cache._store)} 条")
     st.text(f"分析历史: {len(st.session_state.history)} 条")
+
+llm_run_signature = (
+    llm_mode,
+    ollama_base_url or "",
+    ollama_model or "",
+)
 
 
 # ========================================
@@ -170,14 +207,19 @@ if batch_submitted and uploaded_file is not None:
             use_common_chart=use_common_chart,
             llm_pick_value=pick_value,
         )
-        batch_result = asyncio.run(
-            analyze_excel_bytes(
-                uploaded_bytes,
-                uploaded_file.name,
-                deps,
-                on_progress=update_batch_progress,
+        with llm_runtime(
+            backend=llm_backend_override,
+            model=llm_model_override,
+            ollama_base_url=ollama_base_url,
+        ):
+            batch_result = asyncio.run(
+                analyze_excel_bytes(
+                    uploaded_bytes,
+                    uploaded_file.name,
+                    deps,
+                    on_progress=update_batch_progress,
+                )
             )
-        )
         st.session_state.batch_output = {
             "source_digest": uploaded_digest,
             "filename": batch_result.output_filename,
@@ -197,6 +239,7 @@ if batch_submitted and uploaded_file is not None:
             "timings": batch_result.timing_rows(),
             "detail_sheet_name": batch_result.detail_sheet_name,
             "use_common_chart": use_common_chart,
+            "llm_run_signature": llm_run_signature,
         }
     except ExcelInputError as exc:
         st.session_state.batch_output = None
@@ -216,6 +259,7 @@ if (
     and batch_output is not None
     and batch_output["source_digest"] == uploaded_digest
     and batch_output["use_common_chart"] == use_common_chart
+    and batch_output["llm_run_signature"] == llm_run_signature
 ):
     if batch_output["failed"] or batch_output["review"]:
         st.warning(
@@ -277,12 +321,20 @@ if (
         "本次分析的 T0.5 Common Chart："
         f"{'已启用' if batch_output['use_common_chart'] else '已关闭'}"
     )
+    st.caption(
+        "本次 LLM："
+        + (
+            f"Ollama / {batch_output['llm_run_signature'][2]}"
+            if batch_output["llm_run_signature"][0] == "ollama"
+            else f"环境配置（{settings.LLM_BACKEND}）"
+        )
+    )
 elif (
     uploaded_file is not None
     and batch_output is not None
     and batch_output["source_digest"] == uploaded_digest
 ):
-    st.info("T0.5 Common Chart 设置已变化，请重新点击“开始批量分析”。")
+    st.info("分析设置已变化，请重新点击“开始批量分析”。")
 
 st.divider()
 st.subheader("✍️ 单条分析（可选）")
@@ -369,15 +421,20 @@ if analyze_submitted and operation.strip():
                 use_common_chart=use_common_chart,
                 llm_pick_value=pick_value,
             )
-            return await analyze_operation(
-                operation.strip(),
-                deps,
-                line_name=line or "手动输入",
-                station_op=station or "手动输入",
-                freq=freq,
-                on_decomposed=show_decomposition,
-                on_progress=show_item_progress,
-            )
+            with llm_runtime(
+                backend=llm_backend_override,
+                model=llm_model_override,
+                ollama_base_url=ollama_base_url,
+            ):
+                return await analyze_operation(
+                    operation.strip(),
+                    deps,
+                    line_name=line or "手动输入",
+                    station_op=station or "手动输入",
+                    freq=freq,
+                    on_decomposed=show_decomposition,
+                    on_progress=show_item_progress,
+                )
 
         single_analysis: OperationAnalysis = asyncio.run(do_analyze())
         st.session_state.single_run_id += 1
@@ -385,6 +442,7 @@ if analyze_submitted and operation.strip():
             "run_id": st.session_state.single_run_id,
             "analysis": single_analysis,
             "use_common_chart": use_common_chart,
+            "llm_run_signature": llm_run_signature,
         }
         status_state = "complete" if single_analysis.status == "成功" else "error"
         single_status.update(
@@ -405,6 +463,10 @@ if single_output is not None:
     single_analysis: OperationAnalysis = single_output["analysis"]
     single_run_id = single_output["run_id"]
     single_use_common_chart = single_output.get("use_common_chart", False)
+    single_llm_signature = single_output.get(
+        "llm_run_signature",
+        ("configured", "", ""),
+    )
     st.divider()
     st.subheader("📋 单条分析结果")
 
@@ -422,7 +484,12 @@ if single_output is not None:
         f"拆解阶段 {single_analysis.decompose_elapsed_s:.2f} 秒｜"
         f"工时分析阶段 {single_analysis.analysis_elapsed_s:.2f} 秒｜"
         f"状态：{single_analysis.status}｜T0.5 Common Chart："
-        f"{'已启用' if single_use_common_chart else '已关闭'}"
+        f"{'已启用' if single_use_common_chart else '已关闭'}｜LLM："
+        + (
+            f"Ollama / {single_llm_signature[2]}"
+            if single_llm_signature[0] == "ollama"
+            else f"环境配置（{settings.LLM_BACKEND}）"
+        )
     )
 
     if single_analysis.split.error:

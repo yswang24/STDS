@@ -8,7 +8,11 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any, Optional, Type
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Any, Iterator, Optional, Type
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel
@@ -21,6 +25,65 @@ logger = logging.getLogger("stds.llm")
 
 class LLMError(Exception):
     pass
+
+
+SUPPORTED_LLM_BACKENDS = frozenset({"auto", "vllm", "custom", "ollama", "mock"})
+
+
+@dataclass(frozen=True)
+class LLMRuntimeOptions:
+    """单次分析任务的 LLM 覆盖项；ContextVar 保证并发任务互不串配置。"""
+
+    backend: Optional[str] = None
+    model: Optional[str] = None
+    ollama_base_url: Optional[str] = None
+
+
+_runtime_options: ContextVar[LLMRuntimeOptions] = ContextVar(
+    "stds_llm_runtime_options",
+    default=LLMRuntimeOptions(),
+)
+
+
+def _normalize_ollama_base_url(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().rstrip("/")
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Ollama 地址必须是有效的 http(s) URL")
+    # 同时兼容官方文档常写的 .../api 和项目历史配置使用的服务根地址。
+    if normalized.endswith("/api"):
+        normalized = normalized[:-4]
+    return normalized
+
+
+def get_llm_runtime_options() -> LLMRuntimeOptions:
+    return _runtime_options.get()
+
+
+@contextmanager
+def llm_runtime(
+    *,
+    backend: Optional[str] = None,
+    model: Optional[str] = None,
+    ollama_base_url: Optional[str] = None,
+) -> Iterator[LLMRuntimeOptions]:
+    """为当前同步/异步任务临时指定后端和模型，退出后自动恢复。"""
+    normalized_backend = str(backend).strip().lower() if backend else None
+    if normalized_backend and normalized_backend not in SUPPORTED_LLM_BACKENDS:
+        raise ValueError(f"不支持的 LLM 后端: {backend}")
+    normalized_model = str(model).strip() if model else None
+    options = LLMRuntimeOptions(
+        backend=normalized_backend,
+        model=normalized_model,
+        ollama_base_url=_normalize_ollama_base_url(ollama_base_url),
+    )
+    token = _runtime_options.set(options)
+    try:
+        yield options
+    finally:
+        _runtime_options.reset(token)
 
 
 class _LLMResponseError(LLMError):
@@ -295,9 +358,13 @@ class _OpenAIClient:
 # ---------- Ollama ----------
 
 class _OllamaClient:
-    def __init__(self):
-        self.base = settings.OLLAMA_BASE
-        self.model = settings.LLM_MODEL
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+    ):
+        self.base = _normalize_ollama_base_url(base_url or settings.OLLAMA_BASE)
+        self.model = model or settings.OLLAMA_LLM_MODEL
 
     async def structured(
         self,
@@ -316,15 +383,32 @@ class _OllamaClient:
             full_prompt = prompt + "\n" + schema_instr
         for attempt in range(retries + 1):
             try:
+                payload = {
+                    "model": model,
+                    "prompt": "" if exact_system_prompt else full_prompt,
+                    "format": schema.model_json_schema(),
+                    "stream": False,
+                    "options": {"temperature": 0.1},
+                }
+                if exact_system_prompt:
+                    payload["system"] = full_prompt
                 r = httpx.post(
                     f"{self.base}/api/generate",
-                    json={"model": model, "prompt": full_prompt, "format": "json", "stream": False},
+                    json=payload,
                     timeout=120,
                 )
-                data = json.loads(r.json()["response"])
+                response_data = r.json()
+                if r.status_code >= 400 or response_data.get("error"):
+                    message = response_data.get("error") or f"HTTP {r.status_code}"
+                    raise _LLMResponseError(r.status_code, f"Ollama: {message}")
+                data = _json_from_content(response_data["response"])
                 return schema.model_validate(data)
-            except Exception as e:
-                last = e
+            except Exception as exc:
+                last = exc
+                if attempt < retries and isinstance(exc, _LLMResponseError) and (
+                    exc.status_code == 429 or exc.status_code >= 500
+                ):
+                    await asyncio.sleep(min(2 ** attempt, 4))
         raise LLMError(f"Ollama 结构化失败: {last}")
 
 
@@ -374,6 +458,11 @@ def _get_extra_headers() -> dict:
 
 def _get_backend():
     global _backend
+    runtime_backend = get_llm_runtime_options().backend
+    if runtime_backend and runtime_backend != "auto":
+        return runtime_backend
+    if runtime_backend == "auto":
+        return _detect_backend()
     if _backend is None:
         forced = settings.LLM_BACKEND.lower()
         if forced == "auto":
@@ -384,6 +473,7 @@ def _get_backend():
 
 
 def _make_client(backend: str):
+    runtime = get_llm_runtime_options()
     if backend == "vllm":
         return _OpenAIClient(
             settings.VLLM_BASE_URL,
@@ -396,16 +486,26 @@ def _make_client(backend: str):
             settings.CUSTOM_API_BASE_URL, settings.CUSTOM_API_KEY, settings.CUSTOM_LLM_MODEL,
             extra_headers=_get_extra_headers(),
         )
-    else:
-        return _OllamaClient()
+    elif backend == "ollama":
+        return _OllamaClient(
+            base_url=runtime.ollama_base_url,
+            model=runtime.model,
+        )
+    raise LLMError(f"不支持的 LLM 后端: {backend}")
 
 
 async def structured(prompt: str, schema: Type[BaseModel], model: Optional[str] = None, retries: int = 2):
     """统一接口:根据配置自动选择后端。"""
     backend = _get_backend()
+    selected_model = model or get_llm_runtime_options().model
     if backend == "mock":
-        return await _mock.structured(prompt, schema, model, retries)
-    return await _make_client(backend).structured(prompt, schema, model, retries)
+        return await _mock.structured(prompt, schema, selected_model, retries)
+    return await _make_client(backend).structured(
+        prompt,
+        schema,
+        selected_model,
+        retries,
+    )
 
 
 async def structured_system(
@@ -416,18 +516,19 @@ async def structured_system(
 ):
     """将 prompt 原样作为 system message 发送，不拼接任何额外提示文本。"""
     backend = _get_backend()
+    selected_model = model or get_llm_runtime_options().model
     if backend == "mock":
         return await _mock.structured(
             prompt,
             schema,
-            model,
+            selected_model,
             retries,
             exact_system_prompt=True,
         )
     return await _make_client(backend).structured(
         prompt,
         schema,
-        model,
+        selected_model,
         retries,
         exact_system_prompt=True,
     )

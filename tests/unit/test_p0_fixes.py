@@ -179,6 +179,50 @@ def test_api_jobs_forwards_common_chart_switch(monkeypatch):
     assert captured["use_common_chart"] is False
 
 
+def test_api_background_job_uses_isolated_ollama_runtime(monkeypatch):
+    from stds.api import main
+    from stds.llm.client import get_llm_runtime_options
+
+    captured = {}
+
+    async def fake_run_station(line, station, job_id, deps, state):
+        captured["line"] = line
+        captured["station"] = station
+        captured["options"] = get_llm_runtime_options()
+
+    monkeypatch.setattr(main, "run_station", fake_run_station)
+    req = main.JobRequest(
+        line_name="L",
+        station_op="S",
+        llm_backend="ollama",
+        llm_model="qwen3:8b",
+        ollama_base_url="http://localhost:11434",
+    )
+    asyncio.run(main._run_station_with_llm(req, "job-ollama", object()))
+
+    assert captured["line"] == "L"
+    assert captured["station"] == "S"
+    assert captured["options"].backend == "ollama"
+    assert captured["options"].model == "qwen3:8b"
+    assert get_llm_runtime_options().backend is None
+
+
+def test_api_rejects_invalid_ollama_url():
+    from fastapi.testclient import TestClient
+    from stds.api.main import create_app
+
+    response = TestClient(create_app()).post(
+        "/jobs",
+        json={
+            "llm_backend": "ollama",
+            "ollama_base_url": "localhost:11434",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "http" in response.json()["detail"]
+
+
 # ---------- #6 LLM default bias ----------
 
 

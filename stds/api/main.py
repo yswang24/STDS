@@ -12,15 +12,16 @@ import asyncio
 import json
 import uuid
 from dataclasses import asdict
-from typing import Optional
+from typing import Literal, Optional
 
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from stds.cascade.resolver import Deps
 from stds.data.cache import AutoCache
 from stds.data.charts_loader import load_charts
+from stds.llm.client import llm_runtime
 from stds.pipeline.runner import BUS, run_station
 from stds.pipeline.state import RecordStatus, StateManager
 from stds.review.apply import apply_edits
@@ -46,19 +47,48 @@ class JobRequest(BaseModel):
     line_name: str = ""
     station_op: str = ""
     use_common_chart: bool = False
+    llm_backend: Optional[
+        Literal["auto", "vllm", "custom", "ollama", "mock"]
+    ] = None
+    llm_model: Optional[str] = None
+    ollama_base_url: Optional[str] = None
+
+
+async def _run_station_with_llm(
+    req: JobRequest,
+    job_id: str,
+    deps: Deps,
+) -> None:
+    """在任务级上下文中运行，避免并发作业的 Ollama 模型配置相互污染。"""
+    with llm_runtime(
+        backend=req.llm_backend,
+        model=req.llm_model,
+        ollama_base_url=req.ollama_base_url,
+    ):
+        await run_station(req.line_name, req.station_op, job_id, deps, _state)
 
 
 @api.post("/jobs")
 async def start_job(req: JobRequest):
     """启动整工位任务。用 asyncio.create_task 在同一事件循环里运行,确保 SSE 能推到。"""
-    line = req.line_name
-    station = req.station_op
     job_id = str(uuid.uuid4())[:8]
     deps = _get_deps(use_common_chart=req.use_common_chart)
-    asyncio.create_task(run_station(line, station, job_id, deps, _state))
+    # 在返回 job_id 前先验证运行时配置；后台任务内会重新进入同一配置上下文。
+    try:
+        with llm_runtime(
+            backend=req.llm_backend,
+            model=req.llm_model,
+            ollama_base_url=req.ollama_base_url,
+        ):
+            pass
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    asyncio.create_task(_run_station_with_llm(req, job_id, deps))
     return {
         "job_id": job_id,
         "use_common_chart": req.use_common_chart,
+        "llm_backend": req.llm_backend,
+        "llm_model": req.llm_model,
     }
 
 

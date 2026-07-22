@@ -40,7 +40,12 @@ class Settings:
     CUSTOM_API_EXTRA_HEADERS: str = os.environ.get("CUSTOM_API_EXTRA_HEADERS", "")  # JSON 格式
     # Ollama
     OLLAMA_BASE: str = os.environ.get("OLLAMA_BASE", "http://localhost:11434")
-    LLM_MODEL: str = os.environ.get("LLM_MODEL", "qwen3:14b")
+    OLLAMA_LLM_MODEL: str = os.environ.get(
+        "OLLAMA_LLM_MODEL",
+        os.environ.get("LLM_MODEL", "qwen3:14b"),
+    )
+    # 兼容旧配置名。
+    LLM_MODEL: str = OLLAMA_LLM_MODEL
     EMBED_MODEL: str = os.environ.get("EMBED_MODEL", "qwen3-embedding:8b")
     CONFIDENCE_THRESHOLD: float = float(
         os.environ.get("CONFIDENCE_THRESHOLD", "0.75")

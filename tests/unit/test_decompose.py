@@ -12,7 +12,14 @@ from stds.llm.decompose import (
     build_decompose_prompt,
     decompose_operation,
 )
-from stds.llm.client import LLMError, _OpenAIClient
+from stds.llm.client import (
+    LLMError,
+    _OllamaClient,
+    _OpenAIClient,
+    get_llm_runtime_options,
+    llm_runtime,
+    structured_system,
+)
 from stds.llm.prompts import load_prompt
 
 
@@ -182,3 +189,70 @@ def test_openai_error_response_reports_real_service_message(monkeypatch):
 
     with pytest.raises(LLMError, match=r"HTTP 429.*rpm_limit.*request rate exceeded"):
         asyncio.run(client.structured("拆解", DecomposeOut, retries=0))
+
+
+def test_ollama_client_sends_json_schema_and_selected_model(monkeypatch):
+    captured = {}
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"response": '{"operation":["操作人员安装零件"]}'}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs["json"])
+        return Response()
+
+    monkeypatch.setattr("stds.llm.client.httpx.post", fake_post)
+    client = _OllamaClient("http://ollama.test:11434/api", "qwen3:8b")
+    result = asyncio.run(client.structured("拆解操作", DecomposeOut))
+
+    assert result.operation == ["操作人员安装零件"]
+    assert captured["url"] == "http://ollama.test:11434/api/generate"
+    assert captured["model"] == "qwen3:8b"
+    assert captured["format"] == DecomposeOut.model_json_schema()
+    assert captured["stream"] is False
+    assert captured["options"] == {"temperature": 0.1}
+
+
+def test_ollama_runtime_override_applies_to_system_prompt(monkeypatch):
+    captured = {}
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"response": '{"operation":["操作人员拿取零件"]}'}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs["json"])
+        return Response()
+
+    monkeypatch.setattr("stds.llm.client.httpx.post", fake_post)
+    assert get_llm_runtime_options().backend is None
+
+    with llm_runtime(
+        backend="ollama",
+        model="gemma3:4b",
+        ollama_base_url="http://127.0.0.1:11435",
+    ):
+        result = asyncio.run(
+            structured_system("完整系统提示", DecomposeOut, retries=0)
+        )
+        assert get_llm_runtime_options().model == "gemma3:4b"
+
+    assert result.operation == ["操作人员拿取零件"]
+    assert captured["url"] == "http://127.0.0.1:11435/api/generate"
+    assert captured["model"] == "gemma3:4b"
+    assert captured["prompt"] == ""
+    assert captured["system"] == "完整系统提示"
+    assert get_llm_runtime_options().backend is None
+
+
+def test_ollama_runtime_rejects_invalid_base_url():
+    with pytest.raises(ValueError, match="http"):
+        with llm_runtime(backend="ollama", ollama_base_url="localhost:11434"):
+            pass
