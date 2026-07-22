@@ -57,11 +57,11 @@ def test_manual_single_operation_is_decomposed_and_summed():
     assert analysis.status == "成功"
     assert len(decomposed_events) == 1
     assert sorted(event[1] for event in progress_events) == [1, 2, 3]
-    assert [row["拆解序号"] for row in analysis.decomposition_rows()] == [
-        "1/3",
-        "2/3",
-        "3/3",
-    ]
+    decomposition_rows = analysis.decomposition_rows()
+    assert tuple(decomposition_rows[0]) == ("序号", "工位号", "操作内容")
+    assert [row["序号"] for row in decomposition_rows] == [1, 1, 1]
+    assert [row["工位号"] for row in decomposition_rows] == ["手动输入"] * 3
+    assert [row["操作内容"] for row in decomposition_rows] == children
 
 
 def test_machine_single_operation_is_not_decomposed():

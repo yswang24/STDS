@@ -113,15 +113,11 @@ class ExcelDetailResult:
         return len(self.split.operations)
 
     def as_decomposition_preview(self) -> dict:
+        """拆解阶段仅返回最终九列中已经产生的前三列。"""
         return {
-            "工作表": self.input_row.sheet_name,
-            "Excel行": self.input_row.row_index,
-            "原始operation": self.input_row.operation,
-            "主体类型": self.split.actor,
-            "拆解序号": f"{self.child_index}/{self.child_count}",
-            "拆解后operation": self.operation,
-            "拆解来源": self.split.source,
-            "状态": "待复核" if self.split.needs_review else "成功",
+            NUMBER_HEADER: self.input_row.number,
+            STATION_HEADER: self.input_row.station_op,
+            OUTPUT_OPERATION_HEADER: self.operation,
         }
 
     def as_preview(self) -> dict:
@@ -310,6 +306,8 @@ class ExcelProgress:
     actor: str = ""
     sheet_name: str = ""
     row_index: Optional[int] = None
+    number: object = None
+    station_op: str = ""
     child_index: Optional[int] = None
     child_count: Optional[int] = None
 
@@ -698,6 +696,8 @@ async def analyze_excel_bytes(
                     actor=split.actor,
                     sheet_name=input_row.sheet_name,
                     row_index=input_row.row_index,
+                    number=input_row.number,
+                    station_op=input_row.station_op,
                 )
                 timings.append(progress)
                 await notify_progress(progress)
@@ -798,6 +798,8 @@ async def analyze_excel_bytes(
                     actor=detail.split.actor,
                     sheet_name=detail.input_row.sheet_name,
                     row_index=detail.input_row.row_index,
+                    number=detail.input_row.number,
+                    station_op=detail.input_row.station_op,
                     child_index=detail.child_index,
                     child_count=detail.child_count,
                 )

@@ -57,6 +57,8 @@ class OperationAnalysisItem:
 @dataclass
 class OperationAnalysis:
     original_operation: str
+    number: object
+    station_op: str
     split: OperationSplit
     items: list[OperationAnalysisItem]
     decompose_elapsed_s: float
@@ -82,13 +84,12 @@ class OperationAnalysis:
         )
 
     def decomposition_rows(self) -> list[dict]:
+        """拆解阶段仅返回最终输出格式中已经产生的字段。"""
         return [
             {
-                "原始operation": self.original_operation,
-                "主体类型": self.split.actor,
-                "拆解序号": f"{item.index}/{item.total}",
-                "拆解后operation": item.operation,
-                "拆解来源": self.split.source,
+                "序号": self.number,
+                "工位号": self.station_op,
+                "操作内容": item.operation,
             }
             for item in self.items
         ]
@@ -254,6 +255,8 @@ async def analyze_operation(
     analysis_elapsed_s = time.perf_counter() - analysis_started
     return OperationAnalysis(
         original_operation=operation,
+        number=number,
+        station_op=station_op,
         split=split,
         items=items,
         decompose_elapsed_s=decompose_elapsed_s,

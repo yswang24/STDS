@@ -25,11 +25,18 @@ from stds.data.charts_loader import load_charts
 from stds.data.common_chart import load_common_chart
 from stds.llm.client import llm_runtime
 from stds.llm.pick_value import pick_value
-from stds.pipeline.excel_batch import ExcelInputError, ExcelProgress, analyze_excel_bytes
+from stds.pipeline.excel_batch import (
+    NUMBER_HEADER,
+    OUTPUT_OPERATION_HEADER,
+    STATION_HEADER,
+    ExcelInputError,
+    ExcelProgress,
+    analyze_excel_bytes,
+)
 from stds.pipeline.operation_analysis import OperationAnalysis, analyze_operation
 from stds.review.flywheel import on_review_confirmed
 
-BATCH_OUTPUT_SCHEMA_VERSION = 5
+BATCH_OUTPUT_SCHEMA_VERSION = 6
 COMMON_CHART_SETTING_VERSION = 1
 
 # ---------- 初始化(缓存到 session_state) ----------
@@ -173,16 +180,12 @@ if batch_submitted and uploaded_file is not None:
             f"｜累计 {progress.total_elapsed_s:.2f} 秒"
         )
         if progress.phase == "拆解":
-            for index, operation in enumerate(progress.generated_operations, start=1):
+            for operation in progress.generated_operations:
                 live_decomposition_rows.append(
                     {
-                        "工作表": progress.sheet_name,
-                        "Excel行": progress.row_index,
-                        "原始operation": progress.operation,
-                        "主体类型": progress.actor,
-                        "拆解序号": f"{index}/{len(progress.generated_operations)}",
-                        "拆解后operation": operation,
-                        "本条拆解耗时（秒）": round(progress.item_elapsed_s, 2),
+                        NUMBER_HEADER: progress.number,
+                        STATION_HEADER: progress.station_op,
+                        OUTPUT_OPERATION_HEADER: operation,
                     }
                 )
             decomposition_details.dataframe(
@@ -376,14 +379,11 @@ if analyze_submitted and operation.strip():
             live_decomposition.dataframe(
                 [
                     {
-                        "原始operation": operation.strip(),
-                        "主体类型": split.actor,
-                        "拆解序号": f"{index}/{len(split.operations)}",
-                        "拆解后operation": child,
-                        "拆解来源": split.source,
-                        "拆解耗时（秒）": round(elapsed_s, 2),
+                        NUMBER_HEADER: 1,
+                        STATION_HEADER: station or "手动输入",
+                        OUTPUT_OPERATION_HEADER: child,
                     }
-                    for index, child in enumerate(split.operations, start=1)
+                    for child in split.operations
                 ],
                 hide_index=True,
                 width="stretch",

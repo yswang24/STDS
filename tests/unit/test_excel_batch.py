@@ -132,6 +132,11 @@ def test_fixed_template_is_flattened_to_exact_nine_columns():
     assert [row["频率"] for row in front_end_rows] == [1.0] * 5
     assert [row["时间"] for row in front_end_rows] == [1.2] * 5
     assert all(json.loads(row[TRACE_HEADER]) for row in front_end_rows)
+    decomposition_rows = batch.decomposition_rows()
+    assert tuple(decomposition_rows[0]) == INPUT_HEADERS
+    assert [row["序号"] for row in decomposition_rows] == [2] * 5
+    assert [row["工位号"] for row in decomposition_rows] == ["OP010"] * 5
+    assert [row["操作内容"] for row in decomposition_rows] == child_operations
 
 
 def test_duplicate_operations_are_analyzed_once_but_each_source_row_is_output():
