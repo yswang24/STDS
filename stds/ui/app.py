@@ -46,7 +46,7 @@ from stds.pipeline.excel_batch import (
 from stds.pipeline.operation_analysis import OperationAnalysis, analyze_operation
 from stds.review.flywheel import on_review_confirmed
 
-BATCH_OUTPUT_SCHEMA_VERSION = 9
+BATCH_OUTPUT_SCHEMA_VERSION = 10
 COMMON_CHART_SETTING_VERSION = 1
 
 # ---------- 初始化(缓存到 session_state) ----------
@@ -73,6 +73,19 @@ if st.session_state.get("common_chart_setting_version") != COMMON_CHART_SETTING_
 PROMPTS_DIR = Path(__file__).parent.parent / "llm" / "prompts"
 
 st.set_page_config(page_title="STDS 工时分析", layout="wide")
+
+# Streamlit 表格自带 CSV 直接导出前端网格，无法复用后端的清洗与重编号结果。
+# 隐藏该入口，统一使用页面上由 canonical records 生成的显式 CSV/XLSX 按钮。
+st.markdown(
+    """
+    <style>
+    div[data-testid="stElementToolbarButton"]:has([aria-label="Download as CSV"]) {
+        display: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ---------- 侧边栏 ----------
 with st.sidebar:
@@ -158,17 +171,14 @@ def _build_batch_output_payload(batch_result, run_signature, *, input_count=None
         "bytes": batch_result.output_bytes,
         "decomposition_filename": batch_result.decomposition_filename,
         "decomposition_bytes": batch_result.decomposition_bytes,
+        "decomposition_csv_filename": batch_result.decomposition_csv_filename,
+        "decomposition_csv_bytes": batch_result.decomposition_csv_bytes,
+        "output_csv_filename": batch_result.output_csv_filename,
+        "output_csv_bytes": batch_result.output_csv_bytes,
         "preview": batch_result.preview_rows(),
-        "decomposition": batch_result.decomposition_rows(),
-        # Streamlit/PyArrow 不接受同一列同时出现数值和 "NA"；仅展示层转成文本，
-        # 下载工作簿仍保留 Freq/Time(s) 的数值类型和格式。
-        "details": [
-            {
-                key: "" if value is None else str(value)
-                for key, value in row.items()
-            }
-            for row in batch_result.detail_preview_rows()
-        ],
+        "decomposition": batch_result.decomposition_display_rows(),
+        # CSV 与页面展示都使用这一份文本记录；XLSX 仍保留数值类型与格式。
+        "details": batch_result.detail_display_rows(),
         "processed": batch_result.processed_count,
         "review": batch_result.review_count,
         "failed": batch_result.failed_count,
@@ -420,6 +430,7 @@ if (
     st.caption(
         "第 G 列“作业描述”用于工时分析；第 H 列“翻译后作业描述”用于最终结果。"
         "若修改 G 列，请同步确认 H 列。序号无需编辑，下载和提交时会按当前行顺序重建。"
+        "请使用表格下方的 CSV/XLSX 按钮下载，两种格式使用同一份规范化数据。"
     )
     editor_frame = pd.DataFrame(
         batch_flow["initial_rows"],
@@ -478,13 +489,21 @@ if (
             "拆解与翻译耗时",
             f"{reviewed_stage.decompose_elapsed_s:.2f} 秒",
         )
-        review_download_col, review_confirm_col = st.columns(2)
-        review_download_col.download_button(
+        review_csv_col, review_xlsx_col, review_confirm_col = st.columns(3)
+        review_csv_col.download_button(
+            "⬇️ 当前审核版（CSV）",
+            data=reviewed_stage.decomposition_csv_bytes,
+            file_name=reviewed_stage.decomposition_csv_filename,
+            mime="text/csv;charset=utf-8",
+            key=f"batch_review_csv_{batch_flow['run_id']}",
+            on_click="ignore",
+        )
+        review_xlsx_col.download_button(
             "⬇️ 下载当前编辑版 PF 拆解文件（XLSX）",
             data=reviewed_stage.decomposition_bytes,
             file_name=reviewed_stage.decomposition_filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"batch_review_download_{batch_flow['run_id']}",
+            key=f"batch_review_xlsx_{batch_flow['run_id']}",
             on_click="ignore",
         )
         confirm_review = review_confirm_col.button(
@@ -576,8 +595,15 @@ if (
     phase_col1.metric("拆解阶段耗时", f"{batch_output['decompose_elapsed_s']:.2f} 秒")
     phase_col2.metric("工时分析阶段耗时", f"{batch_output['analysis_elapsed_s']:.2f} 秒")
 
-    decomposition_download_col, result_download_col = st.columns(2)
-    decomposition_download_col.download_button(
+    st.markdown("**PF 拆解文件（A:H 八列）**")
+    decomposition_csv_col, decomposition_xlsx_col = st.columns(2)
+    decomposition_csv_col.download_button(
+        "⬇️ 下载 PF 拆解文件（CSV）",
+        data=batch_output["decomposition_csv_bytes"],
+        file_name=batch_output["decomposition_csv_filename"],
+        mime="text/csv;charset=utf-8",
+    )
+    decomposition_xlsx_col.download_button(
         (
             "⬇️ 下载已审核 PF 拆解文件（XLSX）"
             if batch_output["manual_review"]
@@ -587,7 +613,16 @@ if (
         file_name=batch_output["decomposition_filename"],
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-    result_download_col.download_button(
+
+    st.markdown("**工时结果文件（A:N 十四列）**")
+    result_csv_col, result_xlsx_col = st.columns(2)
+    result_csv_col.download_button(
+        "⬇️ 下载工时结果（CSV）",
+        data=batch_output["output_csv_bytes"],
+        file_name=batch_output["output_csv_filename"],
+        mime="text/csv;charset=utf-8",
+    )
+    result_xlsx_col.download_button(
         "⬇️ 下载工时结果（XLSX）",
         data=batch_output["bytes"],
         file_name=batch_output["filename"],
@@ -597,18 +632,19 @@ if (
     st.caption(
         "拆解文件为原七列 PF 格式加“翻译后作业描述”；"
         "工时结果为 A:N 十四列，STDS描述仅展示翻译结果。"
+        "同一组 CSV/XLSX 按钮使用完全相同的行、列和顺序。"
     )
 
-    with st.expander("🧩 最终采用的拆解结果", expanded=True):
+    with st.expander("📋 工时结果预览（A:N 十四列）", expanded=True):
         st.dataframe(
-            batch_output["decomposition"],
+            batch_output["details"],
             hide_index=True,
             width="stretch",
         )
 
-    with st.expander("📋 拆解动作工时分析明细", expanded=True):
+    with st.expander("🧩 PF 拆解预览（A:H 八列）", expanded=False):
         st.dataframe(
-            batch_output["details"],
+            batch_output["decomposition"],
             hide_index=True,
             width="stretch",
         )

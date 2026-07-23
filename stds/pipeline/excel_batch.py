@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import inspect
 import json
 import logging
 import time
 import unicodedata
 from dataclasses import dataclass, replace
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Awaitable, Callable, Mapping, Optional, Sequence
 
@@ -308,6 +309,20 @@ class ExcelDecompositionOutput:
             for detail in row.details
         ]
 
+    def decomposition_display_rows(self) -> list[dict]:
+        return _display_records(
+            DECOMPOSITION_HEADERS,
+            _decomposition_records(self.rows),
+        )
+
+    @property
+    def decomposition_csv_bytes(self) -> bytes:
+        return _write_csv(DECOMPOSITION_HEADERS, _decomposition_records(self.rows))
+
+    @property
+    def decomposition_csv_filename(self) -> str:
+        return build_csv_filename(self.decomposition_filename)
+
     @property
     def detail_count(self) -> int:
         return sum(len(row.details) for row in self.rows)
@@ -355,8 +370,33 @@ class ExcelBatchOutput:
             for detail in row.details
         ]
 
+    def decomposition_display_rows(self) -> list[dict]:
+        return _display_records(
+            DECOMPOSITION_HEADERS,
+            _decomposition_records(self.rows),
+        )
+
+    @property
+    def decomposition_csv_bytes(self) -> bytes:
+        return _write_csv(DECOMPOSITION_HEADERS, _decomposition_records(self.rows))
+
+    @property
+    def decomposition_csv_filename(self) -> str:
+        return build_csv_filename(self.decomposition_filename)
+
     def detail_preview_rows(self) -> list[dict]:
         return [detail.output_row() for row in self.rows for detail in row.details]
+
+    def detail_display_rows(self) -> list[dict]:
+        return _display_records(OUTPUT_HEADERS, _result_records(self.rows))
+
+    @property
+    def output_csv_bytes(self) -> bytes:
+        return _write_csv(OUTPUT_HEADERS, _result_records(self.rows))
+
+    @property
+    def output_csv_filename(self) -> str:
+        return build_csv_filename(self.output_filename)
 
     @property
     def detail_count(self) -> int:
@@ -713,16 +753,64 @@ def _write_records(
     return output.getvalue(), INPUT_SHEET_NAME
 
 
+def _decomposition_records(rows: list[ExcelRowResult]) -> list[list]:
+    return [
+        detail.decomposition_values()
+        for row in rows
+        for detail in row.details
+    ]
+
+
+def _result_records(rows: list[ExcelRowResult]) -> list[list]:
+    return [detail.output_values() for row in rows for detail in row.details]
+
+
+def _export_text(header: str, value: object) -> str:
+    if value is None:
+        return ""
+    if header == TIME_HEADER and isinstance(value, (int, float)):
+        return f"{value:.2f}"
+    if header == FREQ_HEADER and isinstance(value, (int, float)):
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _display_records(headers: tuple[str, ...], records: list[list]) -> list[dict]:
+    """生成与 CSV 相同列序和值文本的前端展示记录。"""
+    return [
+        {
+            header: _export_text(header, value)
+            for header, value in zip(headers, values)
+        }
+        for values in records
+    ]
+
+
+def _write_csv(headers: tuple[str, ...], records: list[list]) -> bytes:
+    """以 UTF-8 BOM 输出 CSV；数据与对应 XLSX 共用同一 records。"""
+    output = StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\r\n")
+    writer.writerow(headers)
+    for values in records:
+        csv_values = []
+        for header, value in zip(headers, values):
+            text = _export_text(header, value)
+            # 防止用户输入的文本在 Excel 打开 CSV 时被当作公式执行。
+            if isinstance(value, str) and value.startswith(("=", "+", "-", "@")):
+                text = "'" + text
+            csv_values.append(text)
+        writer.writerow(csv_values)
+    return ("\ufeff" + output.getvalue()).encode("utf-8")
+
+
 def _write_decomposition(
     workbook,
     rows: list[ExcelRowResult],
 ) -> tuple[bytes, str]:
     """生成八列 PF 拆解文件：七列源结构加翻译后作业描述。"""
-    records = [
-        detail.decomposition_values()
-        for row in rows
-        for detail in row.details
-    ]
+    records = _decomposition_records(rows)
     # 原文和翻译列同时存在时适当加宽，避免两列文字相互遮挡。
     return _write_records(
         workbook,
@@ -734,7 +822,7 @@ def _write_decomposition(
 
 def _write_results(workbook, rows: list[ExcelRowResult]) -> tuple[bytes, str]:
     """生成 3.STDS-工时生成.xlsx 的 A:N，后三列不创建。"""
-    records = [detail.output_values() for row in rows for detail in row.details]
+    records = _result_records(rows)
     return _write_records(
         workbook,
         OUTPUT_HEADERS,
@@ -773,6 +861,10 @@ def build_output_filename(source_name: str) -> str:
         numbered_prefix="3.STDS-工时生成",
         fallback_suffix="工时生成",
     )
+
+
+def build_csv_filename(xlsx_filename: str) -> str:
+    return f"{Path(xlsx_filename).stem}.csv"
 
 
 async def _notify_excel_progress(

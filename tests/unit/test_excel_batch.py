@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from io import BytesIO
+import csv
+from io import BytesIO, StringIO
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -107,6 +108,32 @@ def _sheet(payload: bytes):
 
 def _headers(ws) -> tuple:
     return tuple(ws.cell(1, col).value for col in range(1, ws.max_column + 1))
+
+
+def _csv_rows(payload: bytes) -> list[list[str]]:
+    assert payload.startswith(b"\xef\xbb\xbf")
+    return list(csv.reader(StringIO(payload.decode("utf-8-sig"))))
+
+
+def _sheet_display_rows(ws) -> list[list[str]]:
+    rows = []
+    for row_index in range(1, ws.max_row + 1):
+        values = []
+        for col_index in range(1, ws.max_column + 1):
+            cell = ws.cell(row_index, col_index)
+            value = cell.value
+            if value is None:
+                values.append("")
+            elif cell.number_format == "0.00" and isinstance(value, (int, float)):
+                values.append(f"{value:.2f}")
+            elif cell.number_format == "0.##" and isinstance(value, (int, float)):
+                values.append(f"{value:.2f}".rstrip("0").rstrip("."))
+            elif isinstance(value, float) and value.is_integer():
+                values.append(str(int(value)))
+            else:
+                values.append(str(value))
+        rows.append(values)
+    return rows
 
 
 def test_public_headers_match_the_three_pf_templates():
@@ -226,6 +253,14 @@ def test_reviewed_rows_support_edit_add_delete_reorder_and_split_g_h_usage():
     assert _headers(reviewed_ws) == EXPECTED_DECOMPOSITION_HEADERS
     assert reviewed_ws.max_column == 8
     assert [reviewed_ws.cell(row, 1).value for row in range(2, 5)] == [1, 2, 3]
+    assert reviewed.decomposition_csv_filename == "2.STDS-PF拆解.csv"
+    assert _csv_rows(reviewed.decomposition_csv_bytes) == _sheet_display_rows(
+        reviewed_ws
+    )
+    assert reviewed.decomposition_display_rows() == [
+        dict(zip(EXPECTED_DECOMPOSITION_HEADERS, values))
+        for values in _csv_rows(reviewed.decomposition_csv_bytes)[1:]
+    ]
 
     analyzed_inputs = []
 
@@ -257,6 +292,12 @@ def test_reviewed_rows_support_edit_add_delete_reorder_and_split_g_h_usage():
         original not in [final_ws.cell(row, 9).value for row in range(2, 5)]
         for original in expected_originals[:2]
     )
+    assert batch.output_csv_filename == "3.STDS-工时生成.csv"
+    assert _csv_rows(batch.output_csv_bytes) == _sheet_display_rows(final_ws)
+    assert batch.detail_display_rows() == [
+        dict(zip(EXPECTED_OUTPUT_HEADERS, values))
+        for values in _csv_rows(batch.output_csv_bytes)[1:]
+    ]
 
 
 def test_reviewed_rows_reject_empty_operation_or_empty_table():
@@ -309,6 +350,9 @@ def test_reviewed_formula_like_text_stays_literal_in_download():
     assert ws.cell(2, 7).data_type == "s"
     assert ws.cell(2, 8).value == "=人工确认文本"
     assert ws.cell(2, 8).data_type == "s"
+    csv_rows = _csv_rows(reviewed.decomposition_csv_bytes)
+    assert csv_rows[1][6] == "'=1+1"
+    assert csv_rows[1][7] == "'=人工确认文本"
 
 
 def test_reviewed_auto_operation_is_reclassified_as_machine_without_redecomposition():
