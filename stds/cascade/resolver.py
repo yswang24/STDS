@@ -134,7 +134,7 @@ async def resolve(
 
     # T1 历史 kNN(只复用 chartcode+决策描述,时间重新公式算)
     if deps.history_index is not None:
-        hits = deps.history_index.knn(op, k=5)
+        hits = await deps.history_index.knn(op, k=5)
         if hits:
             logger.debug(f"  [T1] kNN top3: {[(h.chartcode, round(h.score,3)) for h in hits[:3]]}")
         if hits and hits[0].score >= 0.92:

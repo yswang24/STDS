@@ -274,7 +274,7 @@ class _OpenAIClient:
             "model": model,
             "messages": messages,
             "temperature": 0.1,
-            "max_tokens": 512,
+            "max_tokens": settings.MAX_TOKENS,
             "stream": False,
         }
         json_schema = schema.model_json_schema()
@@ -321,7 +321,8 @@ class _OpenAIClient:
         legacy_vllm = False
         while True:
             try:
-                r = httpx.post(
+                r = await asyncio.to_thread(
+                    httpx.post,
                     f"{self.base}/chat/completions",
                     headers=headers,
                     json=self._request_payload(
@@ -399,7 +400,8 @@ class _OllamaClient:
                 }
                 if exact_system_prompt:
                     payload["system"] = full_prompt
-                r = httpx.post(
+                r = await asyncio.to_thread(
+                    httpx.post,
                     f"{self.base}/api/generate",
                     json=payload,
                     timeout=120,

@@ -31,6 +31,9 @@ class Settings:
     VLLM_BASE_URL: str = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
     VLLM_API_KEY: str = os.environ.get("VLLM_API_KEY", "EMPTY")
     VLLM_LLM_MODEL: str = os.environ.get("VLLM_LLM_MODEL", "qwen3-14b")
+    # Embedding 端点:默认留空 → 回退到 VLLM_BASE_URL(对话共用);
+    # 若有独立 embedding 服务(如 8001)则填其 /v1 地址
+    VLLM_EMBED_BASE_URL: str = os.environ.get("VLLM_EMBED_BASE_URL", "")
     VLLM_EMBED_MODEL: str = os.environ.get("VLLM_EMBED_MODEL", "qwen3-embedding")
     # 自定义 API(任意 OpenAI 兼容端点,如 DeepSeek / 智谱 / 自部署)
     CUSTOM_API_BASE_URL: str = os.environ.get("CUSTOM_API_BASE_URL", "http://localhost:9000/v1")
@@ -51,6 +54,7 @@ class Settings:
         os.environ.get("CONFIDENCE_THRESHOLD", "0.75")
     )
     CONCURRENCY_LIMIT: int = int(os.environ.get("CONCURRENCY_LIMIT", "8"))
+    MAX_TOKENS: int = int(os.environ.get("MAX_TOKENS", "4096"))
     STATE_TTL_DAYS: int = int(os.environ.get("STATE_TTL_DAYS", "7"))
 
 

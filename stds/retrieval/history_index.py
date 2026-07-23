@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 from typing import List, Optional
@@ -43,11 +44,11 @@ class HistoryIndex:
             self._metas.append((r["动作代码"], r["决策描述"]))
             self._vecs.append(v)
 
-    def knn(self, text: str, k: int = 5) -> List[Hit]:
+    async def knn(self, text: str, k: int = 5) -> List[Hit]:
         """返回 top-k 相似历史(余弦)。"""
         if not self._vecs:
             return []
-        qvec = self._embed.embed_one(text)
+        qvec = await asyncio.to_thread(self._embed.embed_one, text)
         scored = []
         for i, v in enumerate(self._vecs):
             score = _cosine(qvec, v)
@@ -61,7 +62,7 @@ class HistoryIndex:
         return scored[:k]
 
     def add(self, text: str, result) -> None:
-        """飞轮回灌:复核确认后立即加入索引。"""
+        """飞轮回灌:复核确认后立即加入索引(复核为单次操作,同步可接受)。"""
         vec = self._embed.embed_one(text)
         self._texts.append(text)
         self._metas.append((result.chartcode, result.decision))

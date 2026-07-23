@@ -1,6 +1,7 @@
 """T3:chartcode 向量召回。62 个 chartcode 的标题 embed, top-k + 历史命中投票。"""
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 from typing import List, Optional
@@ -34,9 +35,9 @@ class ChartcodeIndex:
         vecs = self._embed.embed(texts)
         self._chartcodes = list(zip(codes, texts, vecs))
 
-    def retrieve(self, text: str, k: int = 5, threshold: float = 0.85) -> ChartcodeCandidate:
+    async def retrieve(self, text: str, k: int = 5, threshold: float = 0.85) -> ChartcodeCandidate:
         """返回 top-k 召回 + 置信度判断。"""
-        qvec = self._embed.embed_one(text)
+        qvec = await asyncio.to_thread(self._embed.embed_one, text)
         scored = []
         for code, title, vec in self._chartcodes:
             score = _cosine(qvec, vec)

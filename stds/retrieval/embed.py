@@ -140,9 +140,11 @@ def _get_extra_headers() -> dict:
 
 
 def get_embed_backend() -> EmbedBackend:
+    # 优先用独立 embedding 端点;未配置则回退到对话端点 VLLM_BASE_URL
+    embed_base = settings.VLLM_EMBED_BASE_URL or settings.VLLM_BASE_URL
     forced = settings.LLM_BACKEND.lower()
     if forced == "vllm":
-        return _OpenAIEmbed(settings.VLLM_BASE_URL, settings.VLLM_API_KEY, settings.VLLM_EMBED_MODEL)
+        return _OpenAIEmbed(embed_base, settings.VLLM_API_KEY, settings.VLLM_EMBED_MODEL)
     elif forced == "custom":
         return _OpenAIEmbed(
             settings.CUSTOM_API_BASE_URL, settings.CUSTOM_API_KEY, settings.CUSTOM_EMBED_MODEL,
@@ -157,7 +159,7 @@ def get_embed_backend() -> EmbedBackend:
     if _backend is None:
         _backend = _detect_backend()
     if _backend == "vllm":
-        return _OpenAIEmbed(settings.VLLM_BASE_URL, settings.VLLM_API_KEY, settings.VLLM_EMBED_MODEL)
+        return _OpenAIEmbed(embed_base, settings.VLLM_API_KEY, settings.VLLM_EMBED_MODEL)
     elif _backend == "custom":
         return _OpenAIEmbed(
             settings.CUSTOM_API_BASE_URL, settings.CUSTOM_API_KEY, settings.CUSTOM_EMBED_MODEL,

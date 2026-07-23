@@ -1164,44 +1164,42 @@ async def _classify_pending_review_actors(
     deps: Deps,
     sem: asyncio.Semaphore,
 ) -> None:
-    """为审核时新增的歧义动作补做主体判定，但绝不再次执行动作拆解。"""
-    pending_groups: dict[str, list[ExcelDetailResult]] = {}
+    """为审核时新增的歧义动作补做主体判定，但绝不再次执行动作拆解。
+    不做去重:每个待审核明细单独判定。"""
+    pending_units: list[ExcelDetailResult] = []
     for row in rows:
         for detail in row.details:
             if detail.split.actor == PENDING_REVIEW_ACTOR:
-                norm_key = normalize(detail.operation) or detail.operation
-                pending_groups.setdefault(norm_key, []).append(detail)
+                pending_units.append(detail)
 
-    async def classify_group(details: list[ExcelDetailResult]) -> None:
-        representative = details[0]
+    async def classify_group(detail: ExcelDetailResult) -> None:
         try:
             async with sem:
                 actor, source = await classify_operation_actor(
-                    representative.operation,
+                    detail.operation,
                     deps,
                 )
             split = OperationSplit(
                 actor=actor,
-                operations=(representative.operation,),
+                operations=(detail.operation,),
                 source=f"人工审核确认 + {source}",
             )
         except Exception as exc:
             logger.exception(
                 "Reviewed operation actor classification failed: operation=%r",
-                representative.operation,
+                detail.operation,
             )
             split = OperationSplit(
                 actor="人工",
-                operations=(representative.operation,),
+                operations=(detail.operation,),
                 source="人工审核后的主体判定失败",
                 needs_review=True,
                 error=f"{type(exc).__name__}: {exc}",
             )
-        for detail in details:
-            detail.split = split
+        detail.split = split
 
     await asyncio.gather(
-        *(classify_group(details) for details in pending_groups.values())
+        *(classify_group(detail) for detail in pending_units)
     )
     for row in rows:
         if row.split.actor == PENDING_REVIEW_ACTOR and row.details:
@@ -1224,14 +1222,15 @@ async def analyze_decomposition_output(
     analysis_started = time.perf_counter()
     await _classify_pending_review_actors(rows, deps, sem)
 
-    detail_groups: dict[tuple[str, str], list[ExcelDetailResult]] = {}
+    # 不做去重:每个明细(detail)单独作为一个并发单元,按行逐一分析,
+    # 这样并发数由明细行数决定,而非唯一(actor, 操作)组合数。
+    detail_units: list[list[ExcelDetailResult]] = []
     for row in rows:
         for detail in row.details:
-            norm_key = normalize(detail.operation) or detail.operation
-            detail_groups.setdefault((detail.split.actor, norm_key), []).append(detail)
+            detail_units.append([detail])
 
     analysis_completed = 0
-    total_details = sum(len(group) for group in detail_groups.values())
+    total_details = sum(len(unit) for unit in detail_units)
 
     async def analyze_group(group: list[ExcelDetailResult]) -> None:
         nonlocal analysis_completed
@@ -1311,7 +1310,7 @@ async def analyze_decomposition_output(
                 timings.append(progress)
                 await _notify_excel_progress(on_progress, progress)
 
-    await asyncio.gather(*(analyze_group(group) for group in detail_groups.values()))
+    await asyncio.gather(*(analyze_group(unit) for unit in detail_units))
     analysis_elapsed_s = time.perf_counter() - analysis_started
     final_workbook = load_workbook(
         BytesIO(decomposition.source_bytes),
