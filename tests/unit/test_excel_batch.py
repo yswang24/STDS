@@ -1,8 +1,9 @@
-"""STDS PF 七列输入、八列拆解和十四列工时结果契约。"""
+"""STDS PF 七列输入、八列拆解和十五列工时结果契约。"""
 from __future__ import annotations
 
 import asyncio
 import csv
+import json
 from io import BytesIO, StringIO
 
 import pytest
@@ -50,6 +51,7 @@ EXPECTED_OUTPUT_HEADERS = (
     "增值|非增值",
     "Freq",
     "Time(s)",
+    "决策链选择的原因",
 )
 DEFAULT_ROW = [
     88,
@@ -113,6 +115,18 @@ def _headers(ws) -> tuple:
 def _csv_rows(payload: bytes) -> list[list[str]]:
     assert payload.startswith(b"\xef\xbb\xbf")
     return list(csv.reader(StringIO(payload.decode("utf-8-sig"))))
+
+
+def _trace_steps(value: str) -> list[dict[str, str]]:
+    steps = json.loads(value)
+    assert isinstance(steps, list)
+    assert steps
+    assert all(
+        list(step) == ["变量", "选择", "原因"]
+        and all(isinstance(field, str) for field in step.values())
+        for step in steps
+    )
+    return steps
 
 
 def _sheet_display_rows(ws) -> list[list[str]]:
@@ -283,7 +297,7 @@ def test_reviewed_rows_support_edit_add_delete_reorder_and_split_g_h_usage():
     )
     final_ws = _sheet(batch.output_bytes)
     assert _headers(final_ws) == EXPECTED_OUTPUT_HEADERS
-    assert final_ws.max_column == 14
+    assert final_ws.max_column == 15
     assert [final_ws.cell(row, 1).value for row in range(2, 5)] == [1, 2, 3]
     assert [final_ws.cell(row, 9).value for row in range(2, 5)] == (
         expected_translations
@@ -394,6 +408,13 @@ def test_reviewed_auto_operation_is_reclassified_as_machine_without_redecomposit
         "自动 Robot 装载 CTR 到 pallet"
     )
     assert list(batch.detail_preview_rows()[0].values())[9:14] == ["NA"] * 5
+    assert {
+        "变量": "T2_machine",
+        "选择": "设备动作",
+        "原因": "判定为设备动作，跳过人工标准时间计算",
+    } in _trace_steps(
+        batch.detail_preview_rows()[0]["决策链选择的原因"]
+    )
 
 
 def test_reviewed_ambiguous_operation_uses_llm_actor_without_redecomposition():
@@ -621,7 +642,7 @@ def test_pf_input_is_flattened_to_independent_decomposition_and_final_files():
 
     final_ws = _sheet(batch.output_bytes)
     assert _headers(final_ws) == EXPECTED_OUTPUT_HEADERS
-    assert final_ws.max_column == 14
+    assert final_ws.max_column == 15
     assert final_ws.max_row == 6
     assert [final_ws.cell(row, 1).value for row in range(2, 7)] == list(range(1, 6))
     for column, value in enumerate(source_metadata, start=2):
@@ -638,6 +659,12 @@ def test_pf_input_is_flattened_to_independent_decomposition_and_final_files():
     assert [final_ws.cell(row, 12).value for row in range(2, 7)] == ["V"] * 5
     assert [final_ws.cell(row, 13).value for row in range(2, 7)] == [1.0] * 5
     assert [final_ws.cell(row, 14).value for row in range(2, 7)] == [1.2] * 5
+    for row in range(2, 7):
+        assert {
+            "变量": "V1",
+            "选择": "Turn",
+            "原因": "operation-match",
+        } in _trace_steps(final_ws.cell(row, 15).value)
     assert all(final_ws.cell(row, 13).number_format == "0.##" for row in range(2, 7))
     assert all(final_ws.cell(row, 14).number_format == "0.00" for row in range(2, 7))
     assert final_ws.freeze_panes is None
@@ -645,7 +672,7 @@ def test_pf_input_is_flattened_to_independent_decomposition_and_final_files():
     assert all(
         final_ws.cell(row, col).value is None
         for row in range(1, 7)
-        for col in range(15, 18)
+        for col in range(16, 18)
     )
 
     decomposition_rows = batch.decomposition_rows()
@@ -807,7 +834,7 @@ def test_only_final_stds_description_is_translated_analysis_uses_original_text()
 
     final_ws = _sheet(batch.output_bytes)
     assert _headers(final_ws) == EXPECTED_OUTPUT_HEADERS
-    assert final_ws.max_column == 14
+    assert final_ws.max_column == 15
     assert [final_ws.cell(row, 9).value for row in range(2, 5)] == expected_output
     assert all(final_ws.cell(row, 7).value == "NA" for row in range(2, 5))
     assert all(final_ws.cell(row, 8).value == "NA" for row in range(2, 5))
@@ -865,7 +892,7 @@ def test_output_translation_is_deduplicated_and_failure_falls_back_to_original()
 
     final_ws = _sheet(batch.output_bytes)
     assert _headers(final_ws) == EXPECTED_OUTPUT_HEADERS
-    assert final_ws.max_column == 14
+    assert final_ws.max_column == 15
     assert [final_ws.cell(row, 9).value for row in (2, 3)] == expected_fallback
 
 
@@ -897,6 +924,11 @@ def test_auto_machine_translation_failure_still_uses_chinese_auto_prefix():
     final_ws = _sheet(batch.output_bytes)
     assert final_ws.cell(2, 9).value == "自动 Robot Load CTR to pallet"
     assert [final_ws.cell(2, col).value for col in range(10, 15)] == ["NA"] * 5
+    assert {
+        "变量": "T2_machine",
+        "选择": "设备动作",
+        "原因": "判定为设备动作，跳过人工标准时间计算",
+    } in _trace_steps(final_ws.cell(2, 15).value)
 
 
 def test_unresolved_row_has_na_analysis_fields():
@@ -918,6 +950,36 @@ def test_unresolved_row_has_na_analysis_fields():
     final_ws = _sheet(batch.output_bytes)
     assert final_ws.cell(2, 9).value == "无法识别的动作"
     assert [final_ws.cell(2, col).value for col in range(10, 15)] == ["NA"] * 5
+    assert {
+        "变量": "UNRESOLVED",
+        "选择": "",
+        "原因": "未能完成决策解析，需要人工复核",
+    } in _trace_steps(final_ws.cell(2, 15).value)
+
+
+def test_failed_row_trace_preserves_error_reason():
+    async def failing_resolver(element, deps, *, machine_hint=None):
+        raise RuntimeError("resolver exploded")
+
+    batch = asyncio.run(
+        _analyze_excel_bytes(
+            _workbook_bytes(
+                [[4, "项目A", "M1", "L1", "OP040", "异常工位", "触发异常的动作"]]
+            ),
+            "失败.xlsx",
+            object(),
+            resolver=failing_resolver,
+        )
+    )
+
+    assert batch.failed_count == 1
+    final_ws = _sheet(batch.output_bytes)
+    assert [final_ws.cell(2, col).value for col in range(10, 15)] == ["NA"] * 5
+    assert {
+        "变量": "ERROR",
+        "选择": "",
+        "原因": "RuntimeError: resolver exploded",
+    } in _trace_steps(final_ws.cell(2, 15).value)
 
 
 def test_machine_operation_is_not_decomposed_and_outputs_na_analysis_fields():
@@ -951,6 +1013,11 @@ def test_machine_operation_is_not_decomposed_and_outputs_na_analysis_fields():
     assert final_ws.cell(2, 9).value == "设备自动托盘进入"
     assert [final_ws.cell(2, col).value for col in range(10, 15)] == ["NA"] * 5
     assert list(batch.detail_preview_rows()[0].values())[9:14] == ["NA"] * 5
+    assert {
+        "变量": "T2_machine",
+        "选择": "设备动作",
+        "原因": "判定为设备动作，跳过人工标准时间计算",
+    } in _trace_steps(final_ws.cell(2, 15).value)
 
 
 def test_work_description_column_g_is_the_only_analysis_source():

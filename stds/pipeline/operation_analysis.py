@@ -13,6 +13,26 @@ from stds.cascade.resolver import Deps, resolve
 from stds.cascade.rules import normalize
 from stds.domain.models import Source, StdsElement, StdsResult
 from stds.llm.decompose import decompose_operation
+from stds.llm.translate_operation import (
+    OutputTranslator,
+    translate_operation_for_display,
+    translate_operation_for_output,
+)
+from stds.pipeline.output_schema import (
+    CHARTCODE_HEADER,
+    CV_HEADER,
+    DECISION_HEADER,
+    DECISION_REASON_HEADER,
+    FREQ_HEADER,
+    NUMBER_HEADER,
+    OUTPUT_OPERATION_HEADER,
+    PROJECT_HEADER,
+    STATION_HEADER,
+    STDS_HEADER,
+    TIME_HEADER,
+    TRANSLATED_OPERATION_HEADER,
+)
+from stds.pipeline.trace_output import decision_reason
 
 logger = logging.getLogger("stds.operation_analysis")
 
@@ -29,6 +49,12 @@ class OperationSplit:
     source: str
     needs_review: bool = False
     error: Optional[str] = None
+    display_operations: tuple[str, ...] = ()
+
+    @property
+    def output_operations(self) -> tuple[str, ...]:
+        """最终展示文本；拆解原文仍保留在 operations 中用于工时分析。"""
+        return self.display_operations or self.operations
 
 
 @dataclass
@@ -36,10 +62,16 @@ class OperationAnalysisItem:
     index: int
     total: int
     operation: str
+    display_operation: Optional[str] = None
     result: Optional[StdsResult] = None
     error: Optional[str] = None
     elapsed_s: float = 0.0
     split_needs_review: bool = False
+
+    @property
+    def output_operation(self) -> str:
+        """翻译后的展示文本；无翻译结果时回退拆解原文。"""
+        return self.display_operation or self.operation
 
     @property
     def status(self) -> str:
@@ -58,6 +90,7 @@ class OperationAnalysisItem:
 class OperationAnalysis:
     original_operation: str
     number: object
+    line_name: str
     station_op: str
     split: OperationSplit
     items: list[OperationAnalysisItem]
@@ -84,34 +117,46 @@ class OperationAnalysis:
         )
 
     def decomposition_rows(self) -> list[dict]:
-        """拆解阶段仅返回最终输出格式中已经产生的字段。"""
+        """拆解阶段按 PF 拆解表字段返回当前已经产生的内容。"""
         return [
             {
-                "序号": self.number,
-                "工位号": self.station_op,
-                "操作内容": item.operation,
+                NUMBER_HEADER: self.number,
+                PROJECT_HEADER: self.line_name,
+                STATION_HEADER: self.station_op,
+                OUTPUT_OPERATION_HEADER: item.operation,
+                TRANSLATED_OPERATION_HEADER: item.output_operation,
             }
             for item in self.items
         ]
 
     def detail_rows(self) -> list[dict]:
-        return [
-            {
-                "拆解序号": f"{item.index}/{item.total}",
-                "operation": item.operation,
-                "Chartcode": item.result.chartcode if item.result else "",
-                "决策串": item.result.decision if item.result else "",
-                "标准时间（秒）": (
-                    item.result.time_s
-                    if item.result is not None and item.status == "成功"
-                    else None
-                ),
-                "分析耗时（秒）": round(item.elapsed_s, 2),
-                "状态": item.status,
-                "错误": item.error or "",
-            }
-            for item in self.items
-        ]
+        """按最终工时表字段返回单条链路已经产生的内容。"""
+        rows = []
+        for item in self.items:
+            result = item.result
+            if result is None or result.source in {Source.MACHINE, Source.UNRESOLVED}:
+                decision, chartcode, cv, freq, time_value = ("NA",) * 5
+            else:
+                decision = result.decision or "NA"
+                chartcode = result.chartcode or "NA"
+                cv = result.cv or "NA"
+                freq = result.freq if result.freq is not None else "NA"
+                time_value = result.time_s if item.status == "成功" else "NA"
+            rows.append(
+                {
+                    NUMBER_HEADER: self.number,
+                    PROJECT_HEADER: self.line_name,
+                    STATION_HEADER: self.station_op,
+                    STDS_HEADER: item.output_operation,
+                    DECISION_HEADER: decision,
+                    CHARTCODE_HEADER: chartcode,
+                    CV_HEADER: cv,
+                    FREQ_HEADER: freq,
+                    TIME_HEADER: time_value,
+                    DECISION_REASON_HEADER: decision_reason(result, item.error),
+                }
+            )
+        return rows
 
 
 async def _notify(callback: Optional[Callable], *args) -> None:
@@ -214,6 +259,7 @@ async def analyze_operation(
     freq: float = 1.0,
     resolver: Resolver = resolve,
     decomposer: Decomposer = decompose_operation,
+    translator: OutputTranslator = translate_operation_for_output,
     on_decomposed: Optional[DecomposedCallback] = None,
     on_progress: Optional[ItemProgressCallback] = None,
 ) -> OperationAnalysis:
@@ -221,6 +267,19 @@ async def analyze_operation(
     started = time.perf_counter()
     decompose_started = time.perf_counter()
     split = await split_operation(operation, deps, decomposer=decomposer)
+    unique_operations = tuple(dict.fromkeys(split.operations))
+    translated_operations = await asyncio.gather(
+        *(
+            translate_operation_for_display(child, translator=translator)
+            for child in unique_operations
+        )
+    )
+    display_by_operation = dict(zip(unique_operations, translated_operations))
+    display_operations = tuple(
+        display_by_operation[child]
+        for child in split.operations
+    )
+    split = replace(split, display_operations=display_operations)
     decompose_elapsed_s = time.perf_counter() - decompose_started
     await _notify(on_decomposed, split, decompose_elapsed_s)
 
@@ -234,6 +293,7 @@ async def analyze_operation(
             index,
             len(split.operations),
             child,
+            display_operation=split.output_operations[index - 1],
             split_needs_review=split.needs_review,
         )
         try:
@@ -265,6 +325,7 @@ async def analyze_operation(
     return OperationAnalysis(
         original_operation=operation,
         number=number,
+        line_name=line_name,
         station_op=station_op,
         split=split,
         items=items,

@@ -46,7 +46,7 @@ from stds.pipeline.excel_batch import (
 from stds.pipeline.operation_analysis import OperationAnalysis, analyze_operation
 from stds.review.flywheel import on_review_confirmed
 
-BATCH_OUTPUT_SCHEMA_VERSION = 10
+BATCH_OUTPUT_SCHEMA_VERSION = 11
 COMMON_CHART_SETTING_VERSION = 1
 
 # ---------- 初始化(缓存到 session_state) ----------
@@ -614,7 +614,7 @@ if (
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    st.markdown("**工时结果文件（A:N 十四列）**")
+    st.markdown("**工时结果文件（A:O 十五列）**")
     result_csv_col, result_xlsx_col = st.columns(2)
     result_csv_col.download_button(
         "⬇️ 下载工时结果（CSV）",
@@ -631,11 +631,12 @@ if (
     )
     st.caption(
         "拆解文件为原七列 PF 格式加“翻译后作业描述”；"
-        "工时结果为 A:N 十四列，STDS描述仅展示翻译结果。"
+        "工时结果为 A:O 十五列，STDS描述仅展示翻译结果，"
+        "并在最后一列给出决策链选择原因。"
         "同一组 CSV/XLSX 按钮使用完全相同的行、列和顺序。"
     )
 
-    with st.expander("📋 工时结果预览（A:N 十四列）", expanded=True):
+    with st.expander("📋 工时结果预览（A:O 十五列）", expanded=True):
         st.dataframe(
             batch_output["details"],
             hide_index=True,
@@ -746,10 +747,15 @@ if analyze_submitted and operation.strip():
                 [
                     {
                         NUMBER_HEADER: 1,
+                        PROJECT_HEADER: line or "手动输入",
                         STATION_HEADER: station or "手动输入",
                         OUTPUT_OPERATION_HEADER: child,
+                        TRANSLATED_OPERATION_HEADER: display_child,
                     }
-                    for child in split.operations
+                    for child, display_child in zip(
+                        split.operations,
+                        split.output_operations,
+                    )
                 ],
                 hide_index=True,
                 width="stretch",
@@ -762,7 +768,7 @@ if analyze_submitted and operation.strip():
             )
             live_analysis_rows[item.index] = {
                 "拆解序号": f"{item.index}/{item.total}",
-                "operation": item.operation,
+                "operation": item.output_operation,
                 "Chartcode": item.result.chartcode if item.result else "",
                 "决策串": item.result.decision if item.result else "",
                 "标准时间（秒）": (
@@ -882,7 +888,7 @@ if single_output is not None:
     source_labels = {"cache": "缓存命中", "knn": "历史匹配", "formula": "公式计算", "unresolved": "待复核", "machine": "设备"}
 
     for item in single_analysis.items:
-        st.markdown(f"#### {item.index}/{item.total}　{item.operation}")
+        st.markdown(f"#### {item.index}/{item.total}　{item.output_operation}")
         if item.error or item.result is None:
             st.error(item.error or "该动作分析失败")
             continue
@@ -957,7 +963,7 @@ if single_output is not None:
                 item.result = edited
                 st.session_state.history.append({
                     "原始操作": single_analysis.original_operation,
-                    "操作": item.operation,
+                    "操作": item.output_operation,
                     "chartcode": edit_cc,
                     "决策": edit_dec,
                     "时间": edit_time,

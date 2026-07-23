@@ -24,8 +24,7 @@ from stds.config.settings import settings
 from stds.domain.models import Source, StdsElement, StdsResult
 from stds.llm.decompose import decompose_operation
 from stds.llm.translate_operation import (
-    contains_latin_letters,
-    normalize_auto_output_prefix,
+    translate_operation_for_display,
     translate_operation_for_output,
 )
 from stds.pipeline.operation_analysis import (
@@ -36,28 +35,39 @@ from stds.pipeline.operation_analysis import (
     resolve_with_actor,
     split_operation,
 )
+from stds.pipeline.output_schema import (
+    CHARTCODE_HEADER,
+    CV_HEADER,
+    DECISION_HEADER,
+    DECISION_REASON_HEADER,
+    DECOMPOSITION_HEADERS,
+    FREQ_HEADER,
+    INPUT_HEADERS,
+    JES_HEADER,
+    LINE_HEADER,
+    NUMBER_HEADER,
+    OUTPUT_HEADERS,
+    OUTPUT_OPERATION_HEADER,
+    PRODUCT_MODEL_HEADER,
+    PROJECT_HEADER,
+    SOS_HEADER,
+    STATION_DESCRIPTION_HEADER,
+    STATION_HEADER,
+    STDS_HEADER,
+    TIME_HEADER,
+    TRACE_HEADER,
+    TRANSLATED_OPERATION_HEADER,
+)
+from stds.pipeline.trace_output import (
+    EXCEL_CELL_TEXT_LIMIT,
+    decision_reason,
+    result_trace_items,
+    serialize_trace,
+)
 
 logger = logging.getLogger("stds.excel_batch")
 
 INPUT_SHEET_NAME = "数据表"
-NUMBER_HEADER = "序号"
-PROJECT_HEADER = "项目名称"
-PRODUCT_MODEL_HEADER = "产品型号"
-LINE_HEADER = "产线"
-STATION_HEADER = "工位号"
-STATION_DESCRIPTION_HEADER = "工位描述"
-OUTPUT_OPERATION_HEADER = "作业描述"
-TRANSLATED_OPERATION_HEADER = "翻译后作业描述"
-INPUT_HEADERS = (
-    NUMBER_HEADER,
-    PROJECT_HEADER,
-    PRODUCT_MODEL_HEADER,
-    LINE_HEADER,
-    STATION_HEADER,
-    STATION_DESCRIPTION_HEADER,
-    OUTPUT_OPERATION_HEADER,
-)
-DECOMPOSITION_HEADERS = (*INPUT_HEADERS, TRANSLATED_OPERATION_HEADER)
 INPUT_HEADER_ALIASES = {
     NUMBER_HEADER: NUMBER_HEADER,
     "number": NUMBER_HEADER,
@@ -75,33 +85,6 @@ INPUT_HEADER_ALIASES = {
     "operation": OUTPUT_OPERATION_HEADER,
     "operation_des": OUTPUT_OPERATION_HEADER,
 }
-SOS_HEADER = "SOS描述"
-JES_HEADER = "JES描述"
-STDS_HEADER = "STDS描述"
-DECISION_HEADER = "Decisions"
-CHARTCODE_HEADER = "Chart"
-CV_HEADER = "增值|非增值"
-FREQ_HEADER = "Freq"
-TRACE_HEADER = "逐步的决策选择（trace）"
-TIME_HEADER = "Time(s)"
-OUTPUT_HEADERS = (
-    NUMBER_HEADER,
-    PROJECT_HEADER,
-    PRODUCT_MODEL_HEADER,
-    LINE_HEADER,
-    STATION_HEADER,
-    STATION_DESCRIPTION_HEADER,
-    SOS_HEADER,
-    JES_HEADER,
-    STDS_HEADER,
-    DECISION_HEADER,
-    CHARTCODE_HEADER,
-    CV_HEADER,
-    FREQ_HEADER,
-    TIME_HEADER,
-)
-EXCEL_CELL_TEXT_LIMIT = 32767
-TRACE_FIELD_LIMIT = 8000
 PHASE_DECOMPOSE = "拆解"
 PHASE_ANALYZE = "工时分析"
 PENDING_REVIEW_ACTOR = "待判定"
@@ -191,7 +174,7 @@ class ExcelDetailResult:
         )
 
     def output_values(self) -> list:
-        """返回工时生成模板 A:N 的十四列值。"""
+        """返回工时生成模板 A:O 的十五列值。"""
         decision, chartcode, cv, freq, time_value = self.analysis_values()
         return [
             self.output_number,
@@ -208,6 +191,7 @@ class ExcelDetailResult:
             cv,
             freq,
             time_value,
+            decision_reason(self.result, self.error),
         ]
 
     @property
@@ -216,7 +200,7 @@ class ExcelDetailResult:
         return self.display_operation or self.operation
 
     def output_row(self) -> dict:
-        """前端明细与下载工作簿共用的十四列记录。"""
+        """前端明细与下载工作簿共用的十五列记录。"""
         return dict(zip(OUTPUT_HEADERS, self.output_values()))
 
     def time_value(self) -> Optional[float]:
@@ -266,7 +250,7 @@ class ExcelRowResult:
             trace.append(("拆解待复核", "回退为原动作", self.split.error))
         for detail in self.details:
             prefix = f"{detail.child_index}/{detail.child_count}"
-            trace.extend(_result_trace_items(detail.result, detail.error, prefix=prefix))
+            trace.extend(result_trace_items(detail.result, detail.error, prefix=prefix))
         return serialize_trace(trace)
 
     def time_value(self) -> Optional[float]:
@@ -559,76 +543,10 @@ def _load_inputs(excel_bytes: bytes):
     return workbook, input_rows
 
 
-def serialize_trace(trace: list) -> str:
-    """将三元组 trace 序列化为稳定、可被下游再次解析的 JSON。"""
-    steps = []
-    truncated = False
-    for item in trace or []:
-        if isinstance(item, dict):
-            variable = item.get("变量", item.get("variable", item.get("step", "")))
-            choice = item.get("选择", item.get("choice", item.get("description", "")))
-            reason = item.get("原因", item.get("reason", ""))
-        elif isinstance(item, (list, tuple)) and len(item) >= 3:
-            variable, choice, reason = item[:3]
-        else:
-            variable, choice, reason = "", str(item), ""
-        values = [str(variable), str(choice), str(reason)]
-        for index, value in enumerate(values):
-            if len(value) > TRACE_FIELD_LIMIT:
-                values[index] = value[: TRACE_FIELD_LIMIT - 1] + "…"
-                truncated = True
-        steps.append({"变量": values[0], "选择": values[1], "原因": values[2]})
-
-    marker = {"变量": "TRUNCATED", "选择": "", "原因": "trace 超出 Excel 单元格上限，已截断"}
-    serialized = json.dumps(steps, ensure_ascii=False, separators=(",", ":"))
-    if len(serialized) <= EXCEL_CELL_TEXT_LIMIT and not truncated:
-        return serialized
-
-    kept = []
-    for step in steps:
-        candidate = json.dumps(
-            [*kept, step, marker], ensure_ascii=False, separators=(",", ":")
-        )
-        if len(candidate) > EXCEL_CELL_TEXT_LIMIT:
-            truncated = True
-            break
-        kept.append(step)
-    if truncated:
-        kept.append(marker)
-    return json.dumps(kept, ensure_ascii=False, separators=(",", ":"))
-
-
 def _fit_excel_text(value: str) -> str:
     if len(value) <= EXCEL_CELL_TEXT_LIMIT:
         return value
     return value[: EXCEL_CELL_TEXT_LIMIT - 1] + "…"
-
-
-def _result_trace_items(
-    result: Optional[StdsResult],
-    error: Optional[str] = None,
-    *,
-    prefix: str = "",
-) -> list:
-    label = (lambda value: f"{prefix}:{value}" if prefix else value)
-    if result is None:
-        return [(label("ERROR"), "", error or "未知错误")]
-    if result.trace:
-        return [
-            (label(str(item[0])), item[1], item[2])
-            if isinstance(item, (list, tuple)) and len(item) >= 3
-            else (label("trace"), str(item), "")
-            for item in result.trace
-        ]
-    if result.needs_review or result.source == Source.UNRESOLVED:
-        return [
-            (label("UNRESOLVED"), result.chartcode or "", "未能完成决策解析，需要人工复核")
-        ]
-    if result.source == Source.MACHINE:
-        return [
-            (label("T2_machine"), "设备动作", "判定为设备动作，跳过人工标准时间计算")
-        ]
-    return []
 
 
 def _detail_trace(detail: ExcelDetailResult) -> str:
@@ -641,7 +559,7 @@ def _detail_trace(detail: ExcelDetailResult) -> str:
     ]
     if detail.split.error:
         trace.append(("拆解待复核", "回退为原动作", detail.split.error))
-    trace.extend(_result_trace_items(detail.result, detail.error))
+    trace.extend(result_trace_items(detail.result, detail.error))
     return serialize_trace(trace)
 
 
@@ -660,26 +578,16 @@ async def _translate_output_operations(
     grouped_details: dict[str, list[ExcelDetailResult]] = {}
     for row in rows:
         for detail in row.details:
-            if contains_latin_letters(detail.operation):
-                grouped_details.setdefault(detail.operation, []).append(detail)
+            grouped_details.setdefault(detail.operation, []).append(detail)
 
     async def translate_group(
         operation: str,
         details: list[ExcelDetailResult],
     ) -> None:
-        # 即使翻译服务失败，也保证 Auto 设备动作的最终展示以“自动”开头。
-        translated = normalize_auto_output_prefix(operation, operation)
-        try:
-            async with sem:
-                candidate = str(await translator(operation)).strip()
-            if not candidate:
-                raise ValueError("翻译后的操作内容为空")
-            translated = candidate
-        except Exception:
-            logger.warning(
-                "Output operation translation failed; keeping original: operation=%r",
+        async with sem:
+            translated = await translate_operation_for_display(
                 operation,
-                exc_info=True,
+                translator=translator,
             )
         for detail in details:
             detail.display_operation = translated
@@ -821,13 +729,13 @@ def _write_decomposition(
 
 
 def _write_results(workbook, rows: list[ExcelRowResult]) -> tuple[bytes, str]:
-    """生成 3.STDS-工时生成.xlsx 的 A:N，后三列不创建。"""
+    """生成 3.STDS-工时生成.xlsx 的 A:O，原模板后三列不创建。"""
     records = _result_records(rows)
     return _write_records(
         workbook,
         OUTPUT_HEADERS,
         records,
-        widths=[19.0] * len(OUTPUT_HEADERS),
+        widths=[19.0] * (len(OUTPUT_HEADERS) - 1) + [80.0],
         numeric_formats={FREQ_HEADER: "0.##", TIME_HEADER: "0.00"},
     )
 
