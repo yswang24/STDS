@@ -1,4 +1,4 @@
-"""固定模板 Excel 批量输入/输出：拆解 operation 后逐行输出工时结果。"""
+"""STDS Excel 批量输入/输出：保留 PF 元数据并生成拆解与工时文件。"""
 from __future__ import annotations
 
 import asyncio
@@ -10,12 +10,13 @@ import unicodedata
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Mapping, Optional, Sequence
 
 from openpyxl import load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
+from stds.cascade import rules
 from stds.cascade.resolver import Deps, resolve
 from stds.cascade.rules import normalize
 from stds.config.settings import settings
@@ -30,6 +31,7 @@ from stds.pipeline.operation_analysis import (
     Decomposer,
     OperationSplit,
     Resolver,
+    classify_operation_actor,
     resolve_with_actor,
     split_operation,
 )
@@ -38,38 +40,70 @@ logger = logging.getLogger("stds.excel_batch")
 
 INPUT_SHEET_NAME = "数据表"
 NUMBER_HEADER = "序号"
+PROJECT_HEADER = "项目名称"
+PRODUCT_MODEL_HEADER = "产品型号"
+LINE_HEADER = "产线"
 STATION_HEADER = "工位号"
-OUTPUT_OPERATION_HEADER = "操作内容"
-INPUT_HEADERS = (NUMBER_HEADER, STATION_HEADER, OUTPUT_OPERATION_HEADER)
+STATION_DESCRIPTION_HEADER = "工位描述"
+OUTPUT_OPERATION_HEADER = "作业描述"
+TRANSLATED_OPERATION_HEADER = "翻译后作业描述"
+INPUT_HEADERS = (
+    NUMBER_HEADER,
+    PROJECT_HEADER,
+    PRODUCT_MODEL_HEADER,
+    LINE_HEADER,
+    STATION_HEADER,
+    STATION_DESCRIPTION_HEADER,
+    OUTPUT_OPERATION_HEADER,
+)
+DECOMPOSITION_HEADERS = (*INPUT_HEADERS, TRANSLATED_OPERATION_HEADER)
 INPUT_HEADER_ALIASES = {
     NUMBER_HEADER: NUMBER_HEADER,
     "number": NUMBER_HEADER,
+    PROJECT_HEADER: PROJECT_HEADER,
+    "project_name": PROJECT_HEADER,
+    PRODUCT_MODEL_HEADER: PRODUCT_MODEL_HEADER,
+    "product_model": PRODUCT_MODEL_HEADER,
+    LINE_HEADER: LINE_HEADER,
+    "line_name": LINE_HEADER,
     STATION_HEADER: STATION_HEADER,
     "station_op": STATION_HEADER,
+    STATION_DESCRIPTION_HEADER: STATION_DESCRIPTION_HEADER,
+    "station_description": STATION_DESCRIPTION_HEADER,
     OUTPUT_OPERATION_HEADER: OUTPUT_OPERATION_HEADER,
     "operation": OUTPUT_OPERATION_HEADER,
+    "operation_des": OUTPUT_OPERATION_HEADER,
 }
-DECISION_HEADER = "决策描述"
-CHARTCODE_HEADER = "动作代码"
-CV_HEADER = "增值/非增值(C/V)"
-FREQ_HEADER = "频率"
+SOS_HEADER = "SOS描述"
+JES_HEADER = "JES描述"
+STDS_HEADER = "STDS描述"
+DECISION_HEADER = "Decisions"
+CHARTCODE_HEADER = "Chart"
+CV_HEADER = "增值|非增值"
+FREQ_HEADER = "Freq"
 TRACE_HEADER = "逐步的决策选择（trace）"
-TIME_HEADER = "时间"
+TIME_HEADER = "Time(s)"
 OUTPUT_HEADERS = (
     NUMBER_HEADER,
+    PROJECT_HEADER,
+    PRODUCT_MODEL_HEADER,
+    LINE_HEADER,
     STATION_HEADER,
-    OUTPUT_OPERATION_HEADER,
+    STATION_DESCRIPTION_HEADER,
+    SOS_HEADER,
+    JES_HEADER,
+    STDS_HEADER,
     DECISION_HEADER,
     CHARTCODE_HEADER,
     CV_HEADER,
     FREQ_HEADER,
     TIME_HEADER,
-    TRACE_HEADER,
 )
 EXCEL_CELL_TEXT_LIMIT = 32767
 TRACE_FIELD_LIMIT = 8000
 PHASE_DECOMPOSE = "拆解"
 PHASE_ANALYZE = "工时分析"
+PENDING_REVIEW_ACTOR = "待判定"
 
 
 class ExcelInputError(ValueError):
@@ -81,9 +115,12 @@ class ExcelInputRow:
     sheet_name: str
     row_index: int
     operation: str
-    number: int
-    line_name: str
-    station_op: str
+    number: object
+    project_name: object
+    product_model: object
+    line_name: object
+    station_op: object
+    station_description: object
     norm_key: str
 
 
@@ -93,6 +130,7 @@ class ExcelDetailResult:
     split: OperationSplit
     child_index: int
     operation: str
+    output_number: int
     display_operation: Optional[str] = None
     result: Optional[StdsResult] = None
     error: Optional[str] = None
@@ -114,23 +152,26 @@ class ExcelDetailResult:
         return len(self.split.operations)
 
     def as_decomposition_preview(self) -> dict:
-        """拆解阶段仅返回最终九列中已经产生的前三列。"""
-        return {
-            NUMBER_HEADER: self.input_row.number,
-            STATION_HEADER: self.input_row.station_op,
-            OUTPUT_OPERATION_HEADER: self.operation,
-        }
+        """返回 PF 拆解原文以及用于最终输出的翻译结果。"""
+        return dict(zip(DECOMPOSITION_HEADERS, self.decomposition_values()))
+
+    def decomposition_values(self) -> list:
+        """拆解文件保留原文，并新增最终输出所使用的翻译后描述。"""
+        return [
+            self.output_number,
+            self.input_row.project_name,
+            self.input_row.product_model,
+            self.input_row.line_name,
+            self.input_row.station_op,
+            self.input_row.station_description,
+            self.operation,
+            self.output_operation,
+        ]
 
     def as_preview(self) -> dict:
-        decision, chartcode, cv, freq, time_value = self.analysis_values()
         return {
-            **self.as_decomposition_preview(),
-            CHARTCODE_HEADER: chartcode,
-            DECISION_HEADER: decision,
-            CV_HEADER: cv,
-            FREQ_HEADER: freq,
+            **self.output_row(),
             TRACE_HEADER: _detail_trace(self),
-            TIME_HEADER: time_value,
             "状态": self.status,
         }
 
@@ -149,18 +190,23 @@ class ExcelDetailResult:
         )
 
     def output_values(self) -> list:
-        """返回固定九列输出；拆解子动作沿用原始序号和工位号。"""
+        """返回工时生成模板 A:N 的十四列值。"""
         decision, chartcode, cv, freq, time_value = self.analysis_values()
         return [
-            self.input_row.number,
+            self.output_number,
+            self.input_row.project_name,
+            self.input_row.product_model,
+            self.input_row.line_name,
             self.input_row.station_op,
+            self.input_row.station_description,
+            "NA",
+            "NA",
             self.output_operation,
             decision,
             chartcode,
             cv,
             freq,
             time_value,
-            _detail_trace(self),
         ]
 
     @property
@@ -169,7 +215,7 @@ class ExcelDetailResult:
         return self.display_operation or self.operation
 
     def output_row(self) -> dict:
-        """前端明细与下载工作簿共用的固定九列记录。"""
+        """前端明细与下载工作簿共用的十四列记录。"""
         return dict(zip(OUTPUT_HEADERS, self.output_values()))
 
     def time_value(self) -> Optional[float]:
@@ -243,9 +289,43 @@ class ExcelRowResult:
 
 
 @dataclass
+class ExcelDecompositionOutput:
+    """拆解和翻译阶段的可审核快照；此时尚未执行任何工时分析。"""
+
+    source_bytes: bytes
+    source_name: str
+    decomposition_bytes: bytes
+    decomposition_filename: str
+    rows: list[ExcelRowResult]
+    timings: list["ExcelProgress"]
+    total_elapsed_s: float
+    decompose_elapsed_s: float
+
+    def decomposition_rows(self) -> list[dict]:
+        return [
+            detail.as_decomposition_preview()
+            for row in self.rows
+            for detail in row.details
+        ]
+
+    @property
+    def detail_count(self) -> int:
+        return sum(len(row.details) for row in self.rows)
+
+    @property
+    def total_count(self) -> int:
+        return len(self.rows)
+
+    def timing_rows(self) -> list[dict]:
+        return [timing.as_preview() for timing in self.timings]
+
+
+@dataclass
 class ExcelBatchOutput:
     output_bytes: bytes
     output_filename: str
+    decomposition_bytes: bytes
+    decomposition_filename: str
     rows: list[ExcelRowResult]
     timings: list["ExcelProgress"]
     total_elapsed_s: float
@@ -308,7 +388,11 @@ class ExcelProgress:
     sheet_name: str = ""
     row_index: Optional[int] = None
     number: object = None
-    station_op: str = ""
+    project_name: object = None
+    product_model: object = None
+    line_name: object = None
+    station_op: object = None
+    station_description: object = None
     child_index: Optional[int] = None
     child_count: Optional[int] = None
 
@@ -325,7 +409,7 @@ class ExcelProgress:
             "完成进度": f"{self.completed_rows}/{self.total_rows}",
             "工作表": self.sheet_name,
             "Excel行": self.row_index,
-            "operation": self.operation,
+            OUTPUT_OPERATION_HEADER: self.operation,
             "拆解序号": (
                 f"{self.child_index}/{self.child_count}"
                 if self.child_index is not None and self.child_count is not None
@@ -356,7 +440,7 @@ def _canonical_header(value: object) -> str:
 
 
 def _load_inputs(excel_bytes: bytes):
-    """清洗并映射 数据表!A:C 的中英表头，忽略后续列。"""
+    """读取 PF 清单 A:G，并以“作业描述”作为待拆解文本。"""
     if not excel_bytes:
         raise ExcelInputError("上传的 Excel 文件为空")
     try:
@@ -370,24 +454,28 @@ def _load_inputs(excel_bytes: bytes):
 
     ws = workbook[INPUT_SHEET_NAME]
     values_ws = values_workbook[INPUT_SHEET_NAME]
-    actual_headers = tuple(_canonical_header(ws.cell(1, col).value) for col in range(1, 4))
+    actual_headers = tuple(
+        _canonical_header(ws.cell(1, col).value)
+        for col in range(1, len(INPUT_HEADERS) + 1)
+    )
     if actual_headers != INPUT_HEADERS:
         raise ExcelInputError(
-            "数据表第 1 行必须依次为：序号/number、工位号/station_op、"
-            "操作内容/operation"
+            "数据表第 1 行必须依次为："
+            "序号、项目名称、产品型号、产线、工位号、工位描述、作业描述"
         )
 
     input_rows: list[ExcelInputRow] = []
     has_formula_operations = False
+    operation_col = INPUT_HEADERS.index(OUTPUT_OPERATION_HEADER) + 1
 
     for row_index in range(2, ws.max_row + 1):
-        operation_cell = ws.cell(row_index, 3)
+        operation_cell = ws.cell(row_index, operation_col)
         if operation_cell.data_type == "f":
             has_formula_operations = True
-            raw_operation = values_ws.cell(row_index, 3).value
+            raw_operation = values_ws.cell(row_index, operation_col).value
             if raw_operation is None:
                 raise ExcelInputError(
-                    f"数据表第 {row_index} 行的 operation 是公式，"
+                    f"数据表第 {row_index} 行的作业描述是公式，"
                     "但文件中没有已计算值；请先在 Excel 中重新计算并保存"
                 )
         else:
@@ -396,7 +484,11 @@ def _load_inputs(excel_bytes: bytes):
             continue
 
         number_value = ws.cell(row_index, 1).value
-        station_value = ws.cell(row_index, 2).value
+        project_value = ws.cell(row_index, 2).value
+        product_model_value = ws.cell(row_index, 3).value
+        line_value = ws.cell(row_index, 4).value
+        station_value = ws.cell(row_index, 5).value
+        station_description_value = ws.cell(row_index, 6).value
         if number_value in (None, ""):
             raise ExcelInputError(f"数据表第 {row_index} 行的序号不能为空")
         if station_value in (None, ""):
@@ -409,14 +501,17 @@ def _load_inputs(excel_bytes: bytes):
                 row_index=row_index,
                 operation=operation,
                 number=number_value,
-                line_name="Excel导入",
-                station_op=str(station_value).strip(),
+                project_name=project_value,
+                product_model=product_model_value,
+                line_name=line_value,
+                station_op=station_value,
+                station_description=station_description_value,
                 norm_key=normalize(operation) or operation,
             )
         )
 
     if not input_rows:
-        raise ExcelInputError("操作内容字段下没有可解析的输入")
+        raise ExcelInputError("作业描述字段下没有可解析的输入")
     if has_formula_operations:
         workbook.calculation.calcMode = "auto"
         workbook.calculation.fullCalcOnLoad = True
@@ -557,95 +652,163 @@ async def _translate_output_operations(
     )
 
 
-def _write_results(workbook, rows: list[ExcelRowResult]) -> tuple[bytes, str]:
-    """将 数据表 重写为固定九列的逐条拆解结果。"""
+def _reset_output_sheet(workbook):
+    """清空数据表的旧数据与结构，避免尾随空列或旧表格残留。"""
     ws = workbook[INPUT_SHEET_NAME]
     for table_name in list(ws.tables):
         del ws.tables[table_name]
-    if ws.max_row:
-        ws.delete_rows(1, ws.max_row)
+    for merged_range in list(ws.merged_cells.ranges):
+        ws.unmerge_cells(str(merged_range))
+    ws.delete_rows(1, max(1, ws.max_row))
+    ws.delete_cols(1, max(1, ws.max_column))
+    ws.column_dimensions.clear()
+    ws.row_dimensions.clear()
+    ws.freeze_panes = None
+    ws.auto_filter.ref = None
+    return ws
 
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    for col, header in enumerate(OUTPUT_HEADERS, start=1):
+
+def _write_records(
+    workbook,
+    headers: tuple[str, ...],
+    records: list[list],
+    *,
+    widths: Optional[list[Optional[float]]] = None,
+    numeric_formats: Optional[dict[str, str]] = None,
+) -> tuple[bytes, str]:
+    """按样例的简洁表格样式写入记录，并保证物理列数等于表头数。"""
+    ws = _reset_output_sheet(workbook)
+    header_font = Font(name="Calibri", size=10, bold=False)
+    body_font = Font(name="DengXian", size=11, bold=False)
+    center_vertical = Alignment(vertical="center")
+
+    for col, header in enumerate(headers, start=1):
         cell = ws.cell(1, col, header)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.font = header_font
+        cell.alignment = center_vertical
+    ws.row_dimensions[1].height = 25.5
 
-    output_row = 2
-    for row in rows:
-        for detail in row.details:
-            detail_row = detail.output_row()
-            for col, header in enumerate(OUTPUT_HEADERS, start=1):
-                value = detail_row[header]
-                cell = ws.cell(output_row, col, value)
-                cell.alignment = Alignment(
-                    vertical="top",
-                    wrap_text=col in {3, 4, 9},
-                )
-            ws.cell(output_row, OUTPUT_HEADERS.index(FREQ_HEADER) + 1).number_format = "0.##"
-            ws.cell(output_row, OUTPUT_HEADERS.index(TIME_HEADER) + 1).number_format = "0.00"
-            trace_length = len(str(ws.cell(output_row, 9).value or ""))
-            operation_length = len(str(ws.cell(output_row, 3).value or ""))
-            display_lines = max(
-                1,
-                (operation_length + 34) // 35,
-                (trace_length + 74) // 75,
-            )
-            ws.row_dimensions[output_row].height = min(180, display_lines * 15)
-            output_row += 1
+    for output_row, values in enumerate(records, start=2):
+        for col, value in enumerate(values, start=1):
+            cell = ws.cell(output_row, col, value)
+            if isinstance(value, str) and value.startswith("="):
+                # 审核表中的用户文本必须保持为文本，不能在下载后变成公式。
+                cell.data_type = "s"
+            cell.font = body_font
+            cell.alignment = center_vertical
+        ws.row_dimensions[output_row].height = 25.5
 
-    widths = [10, 14, 44, 30, 14, 20, 10, 12, 80]
-    for col, width in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(col)].width = width
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:I{max(1, output_row - 1)}"
-    ws.row_dimensions[1].height = 30
+    for col, width in enumerate(widths or [], start=1):
+        if width is not None:
+            ws.column_dimensions[get_column_letter(col)].width = width
+
+    for header, number_format in (numeric_formats or {}).items():
+        col = headers.index(header) + 1
+        for row_index in range(2, len(records) + 2):
+            if isinstance(ws.cell(row_index, col).value, (int, float)):
+                ws.cell(row_index, col).number_format = number_format
 
     output = BytesIO()
     workbook.save(output)
     return output.getvalue(), INPUT_SHEET_NAME
 
 
-def build_output_filename(source_name: str) -> str:
+def _write_decomposition(
+    workbook,
+    rows: list[ExcelRowResult],
+) -> tuple[bytes, str]:
+    """生成八列 PF 拆解文件：七列源结构加翻译后作业描述。"""
+    records = [
+        detail.decomposition_values()
+        for row in rows
+        for detail in row.details
+    ]
+    # 原文和翻译列同时存在时适当加宽，避免两列文字相互遮挡。
+    return _write_records(
+        workbook,
+        DECOMPOSITION_HEADERS,
+        records,
+        widths=[19.0, None, None, None, None, None, 45.0, 45.0],
+    )
+
+
+def _write_results(workbook, rows: list[ExcelRowResult]) -> tuple[bytes, str]:
+    """生成 3.STDS-工时生成.xlsx 的 A:N，后三列不创建。"""
+    records = [detail.output_values() for row in rows for detail in row.details]
+    return _write_records(
+        workbook,
+        OUTPUT_HEADERS,
+        records,
+        widths=[19.0] * len(OUTPUT_HEADERS),
+        numeric_formats={FREQ_HEADER: "0.##", TIME_HEADER: "0.00"},
+    )
+
+
+def _build_stage_filename(
+    source_name: str,
+    *,
+    numbered_prefix: str,
+    fallback_suffix: str,
+) -> str:
     safe_name = Path(source_name or "input.xlsx").name
     stem = Path(safe_name).stem or "input"
-    return f"{stem}_解析结果.xlsx"
+    source_prefix = "1.STDS-PF清单"
+    if stem.casefold().startswith(source_prefix.casefold()):
+        stem = numbered_prefix + stem[len(source_prefix) :]
+        return f"{stem}.xlsx"
+    return f"{stem}_{fallback_suffix}.xlsx"
 
 
-async def analyze_excel_bytes(
+def build_decomposition_filename(source_name: str) -> str:
+    return _build_stage_filename(
+        source_name,
+        numbered_prefix="2.STDS-PF拆解",
+        fallback_suffix="PF拆解",
+    )
+
+
+def build_output_filename(source_name: str) -> str:
+    return _build_stage_filename(
+        source_name,
+        numbered_prefix="3.STDS-工时生成",
+        fallback_suffix="工时生成",
+    )
+
+
+async def _notify_excel_progress(
+    on_progress: Optional[ProgressCallback],
+    progress: ExcelProgress,
+) -> None:
+    if on_progress is None:
+        return
+    try:
+        maybe_awaitable = on_progress(progress)
+        if inspect.isawaitable(maybe_awaitable):
+            await maybe_awaitable
+    except Exception:
+        logger.debug("Excel progress callback failed", exc_info=True)
+
+
+async def decompose_excel_bytes(
     excel_bytes: bytes,
     source_name: str,
     deps: Deps,
     *,
-    resolver: Resolver = resolve,
     decomposer: Decomposer = decompose_operation,
     translator: OutputTranslator = translate_operation_for_output,
     concurrency: Optional[int] = None,
     on_progress: Optional[ProgressCallback] = None,
-) -> ExcelBatchOutput:
-    """先拆解 operation，再逐个子动作计算工时并回写完整审计结果。"""
+) -> ExcelDecompositionOutput:
+    """只执行拆解与展示文本翻译，供人工审核；不会调用工时 resolver。"""
     batch_started = time.perf_counter()
     workbook, input_rows = _load_inputs(excel_bytes)
     timings: list[ExcelProgress] = []
     sem = asyncio.Semaphore(max(1, concurrency or settings.CONCURRENCY_LIMIT))
 
-    async def notify_progress(progress: ExcelProgress) -> None:
-        if on_progress is None:
-            return
-        try:
-            maybe_awaitable = on_progress(progress)
-            if inspect.isawaitable(maybe_awaitable):
-                await maybe_awaitable
-        except Exception:
-            logger.debug("Excel progress callback failed", exc_info=True)
-
     grouped_rows: dict[str, list[ExcelInputRow]] = {}
     for input_row in input_rows:
         grouped_rows.setdefault(input_row.norm_key, []).append(input_row)
 
-    # ---------- 阶段 1：主体判定 + Dify Prompt 拆解 ----------
-    decompose_started = time.perf_counter()
     decompose_completed = 0
 
     async def split_group(
@@ -676,8 +839,7 @@ async def analyze_excel_bytes(
                 representative.operation,
                 [(input_row.sheet_name, input_row.row_index) for input_row in group],
             )
-            error = f"{type(exc).__name__}: {exc}"
-            split = replace(split, error=error)
+            split = replace(split, error=f"{type(exc).__name__}: {exc}")
             return norm_key, split
         finally:
             item_elapsed_s = (
@@ -699,42 +861,283 @@ async def analyze_excel_bytes(
                     sheet_name=input_row.sheet_name,
                     row_index=input_row.row_index,
                     number=input_row.number,
+                    project_name=input_row.project_name,
+                    product_model=input_row.product_model,
+                    line_name=input_row.line_name,
                     station_op=input_row.station_op,
+                    station_description=input_row.station_description,
                 )
                 timings.append(progress)
-                await notify_progress(progress)
+                await _notify_excel_progress(on_progress, progress)
 
     split_pairs = await asyncio.gather(
-        *(
-            split_group(norm_key, group)
-            for norm_key, group in grouped_rows.items()
-        )
+        *(split_group(norm_key, group) for norm_key, group in grouped_rows.items())
     )
     split_by_key = dict(split_pairs)
-    decompose_elapsed_s = time.perf_counter() - decompose_started
 
     rows: list[ExcelRowResult] = []
+    output_number = 0
     for input_row in input_rows:
         split = split_by_key[input_row.norm_key]
-        details = [
-            ExcelDetailResult(
-                input_row=input_row,
-                split=split,
-                child_index=index,
-                operation=operation,
+        details = []
+        for index, operation in enumerate(split.operations, start=1):
+            output_number += 1
+            details.append(
+                ExcelDetailResult(
+                    input_row=input_row,
+                    split=split,
+                    child_index=index,
+                    operation=operation,
+                    output_number=output_number,
+                )
             )
-            for index, operation in enumerate(split.operations, start=1)
-        ]
         rows.append(ExcelRowResult(input_row=input_row, split=split, details=details))
 
-    # ---------- 阶段 2：对拆解后的每个动作计算工时 ----------
+    # 翻译在人工审核前完成；工时分析始终使用第 G 列拆解原文。
+    await _translate_output_operations(rows, translator, sem)
+    decomposition_bytes, _ = _write_decomposition(workbook, rows)
+    decompose_elapsed_s = time.perf_counter() - batch_started
+    return ExcelDecompositionOutput(
+        source_bytes=bytes(excel_bytes),
+        source_name=source_name,
+        decomposition_bytes=decomposition_bytes,
+        decomposition_filename=build_decomposition_filename(source_name),
+        rows=rows,
+        timings=timings,
+        total_elapsed_s=decompose_elapsed_s,
+        decompose_elapsed_s=decompose_elapsed_s,
+    )
+
+
+def _is_blank_review_value(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    try:
+        unequal = value != value
+        if bool(unequal):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip() in {"", "<NA>", "NaT"}
+
+
+def _clean_review_value(value: object) -> object:
+    if _is_blank_review_value(value):
+        return None
+    return value.strip() if isinstance(value, str) else value
+
+
+def _review_actor(
+    operation: str,
+    actor_by_norm_key: Mapping[str, str],
+) -> str:
+    """按动作键复用主体；歧义的新动作留给异步分析阶段完整判定。"""
+    norm_key = normalize(operation) or operation
+    if norm_key in actor_by_norm_key:
+        return actor_by_norm_key[norm_key]
+    try:
+        machine = rules.rule_machine(operation)
+    except Exception:
+        logger.debug("Reviewed operation actor rule failed", exc_info=True)
+        machine = None
+    if machine is None:
+        return PENDING_REVIEW_ACTOR
+    return "设备" if machine else "人工"
+
+
+def review_decomposition_rows(
+    decomposition: ExcelDecompositionOutput,
+    records: Sequence[Mapping[str, object]],
+) -> ExcelDecompositionOutput:
+    """校验前端审核记录、按当前顺序重编号，并生成可下载的八列工作簿。"""
+    actor_candidates: dict[str, set[str]] = {}
+    for row in decomposition.rows:
+        for detail in row.details:
+            if (
+                detail.split.needs_review
+                or detail.split.error
+                or detail.split.actor not in {"人工", "设备"}
+            ):
+                continue
+            norm_key = normalize(detail.operation) or detail.operation
+            actor_candidates.setdefault(norm_key, set()).add(detail.split.actor)
+    actor_by_norm_key = {
+        norm_key: next(iter(actors))
+        for norm_key, actors in actor_candidates.items()
+        if len(actors) == 1
+    }
+    reviewed_rows: list[ExcelRowResult] = []
+
+    for editor_index, record in enumerate(records, start=1):
+        if not isinstance(record, Mapping):
+            raise ExcelInputError(f"人工审核表第 {editor_index} 行格式无效")
+        missing_headers = [
+            header for header in DECOMPOSITION_HEADERS[1:] if header not in record
+        ]
+        if missing_headers:
+            raise ExcelInputError(
+                "人工审核表缺少字段：" + "、".join(missing_headers)
+            )
+
+        editable_values = [record.get(header) for header in DECOMPOSITION_HEADERS[1:]]
+        if all(_is_blank_review_value(value) for value in editable_values):
+            continue
+
+        cleaned_record = {
+            header: _clean_review_value(record.get(header))
+            for header in DECOMPOSITION_HEADERS[1:]
+        }
+        for header, value in cleaned_record.items():
+            if isinstance(value, str) and len(value) > EXCEL_CELL_TEXT_LIMIT:
+                raise ExcelInputError(
+                    f"人工审核表第 {editor_index} 行的{header}超过 Excel 单元格长度上限"
+                )
+
+        station_op = cleaned_record[STATION_HEADER]
+        if station_op is None:
+            raise ExcelInputError(f"人工审核表第 {editor_index} 行的工位号不能为空")
+        operation_value = cleaned_record[OUTPUT_OPERATION_HEADER]
+        if operation_value is None:
+            raise ExcelInputError(f"人工审核表第 {editor_index} 行的作业描述不能为空")
+        translated_value = cleaned_record[TRANSLATED_OPERATION_HEADER]
+        if translated_value is None:
+            raise ExcelInputError(
+                f"人工审核表第 {editor_index} 行的翻译后作业描述不能为空"
+            )
+
+        operation = str(operation_value)
+        translated_operation = str(translated_value)
+        output_number = len(reviewed_rows) + 1
+        actor = _review_actor(operation, actor_by_norm_key)
+        split = OperationSplit(
+            actor=actor,
+            operations=(operation,),
+            source=(
+                "人工审核确认（待主体判定）"
+                if actor == PENDING_REVIEW_ACTOR
+                else "人工审核确认"
+            ),
+        )
+        input_row = ExcelInputRow(
+            sheet_name=INPUT_SHEET_NAME,
+            row_index=output_number + 1,
+            operation=operation,
+            number=output_number,
+            project_name=cleaned_record[PROJECT_HEADER],
+            product_model=cleaned_record[PRODUCT_MODEL_HEADER],
+            line_name=cleaned_record[LINE_HEADER],
+            station_op=station_op,
+            station_description=cleaned_record[STATION_DESCRIPTION_HEADER],
+            norm_key=normalize(operation) or operation,
+        )
+        detail = ExcelDetailResult(
+            input_row=input_row,
+            split=split,
+            child_index=1,
+            operation=operation,
+            output_number=output_number,
+            display_operation=translated_operation,
+        )
+        reviewed_rows.append(
+            ExcelRowResult(input_row=input_row, split=split, details=[detail])
+        )
+
+    if not reviewed_rows:
+        raise ExcelInputError("人工审核表至少需要保留一条拆解动作")
+
+    workbook = load_workbook(BytesIO(decomposition.source_bytes), data_only=False)
+    decomposition_bytes, _ = _write_decomposition(workbook, reviewed_rows)
+    return replace(
+        decomposition,
+        decomposition_bytes=decomposition_bytes,
+        rows=reviewed_rows,
+        timings=list(decomposition.timings),
+    )
+
+
+def _clone_rows_for_analysis(rows: list[ExcelRowResult]) -> list[ExcelRowResult]:
+    cloned_rows: list[ExcelRowResult] = []
+    for row in rows:
+        details = [replace(detail, result=None, error=None) for detail in row.details]
+        cloned_rows.append(
+            ExcelRowResult(input_row=row.input_row, split=row.split, details=details)
+        )
+    return cloned_rows
+
+
+async def _classify_pending_review_actors(
+    rows: list[ExcelRowResult],
+    deps: Deps,
+    sem: asyncio.Semaphore,
+) -> None:
+    """为审核时新增的歧义动作补做主体判定，但绝不再次执行动作拆解。"""
+    pending_groups: dict[str, list[ExcelDetailResult]] = {}
+    for row in rows:
+        for detail in row.details:
+            if detail.split.actor == PENDING_REVIEW_ACTOR:
+                norm_key = normalize(detail.operation) or detail.operation
+                pending_groups.setdefault(norm_key, []).append(detail)
+
+    async def classify_group(details: list[ExcelDetailResult]) -> None:
+        representative = details[0]
+        try:
+            async with sem:
+                actor, source = await classify_operation_actor(
+                    representative.operation,
+                    deps,
+                )
+            split = OperationSplit(
+                actor=actor,
+                operations=(representative.operation,),
+                source=f"人工审核确认 + {source}",
+            )
+        except Exception as exc:
+            logger.exception(
+                "Reviewed operation actor classification failed: operation=%r",
+                representative.operation,
+            )
+            split = OperationSplit(
+                actor="人工",
+                operations=(representative.operation,),
+                source="人工审核后的主体判定失败",
+                needs_review=True,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        for detail in details:
+            detail.split = split
+
+    await asyncio.gather(
+        *(classify_group(details) for details in pending_groups.values())
+    )
+    for row in rows:
+        if row.split.actor == PENDING_REVIEW_ACTOR and row.details:
+            row.split = row.details[0].split
+
+
+async def analyze_decomposition_output(
+    decomposition: ExcelDecompositionOutput,
+    deps: Deps,
+    *,
+    resolver: Resolver = resolve,
+    concurrency: Optional[int] = None,
+    on_progress: Optional[ProgressCallback] = None,
+) -> ExcelBatchOutput:
+    """对已确认的拆解快照执行工时分析，不再次拆解或翻译。"""
+    analysis_batch_started = time.perf_counter()
+    rows = _clone_rows_for_analysis(decomposition.rows)
+    timings = list(decomposition.timings)
+    sem = asyncio.Semaphore(max(1, concurrency or settings.CONCURRENCY_LIMIT))
+    analysis_started = time.perf_counter()
+    await _classify_pending_review_actors(rows, deps, sem)
+
     detail_groups: dict[tuple[str, str], list[ExcelDetailResult]] = {}
     for row in rows:
         for detail in row.details:
             norm_key = normalize(detail.operation) or detail.operation
             detail_groups.setdefault((detail.split.actor, norm_key), []).append(detail)
 
-    analysis_started = time.perf_counter()
     analysis_completed = 0
     total_details = sum(len(group) for group in detail_groups.values())
 
@@ -748,10 +1151,11 @@ async def analyze_excel_bytes(
                 element = StdsElement(
                     number=representative.input_row.number,
                     operation_des=representative.operation,
-                    line_name=representative.input_row.line_name,
-                    station_op=representative.input_row.station_op,
+                    line_name=str(representative.input_row.line_name or "").strip(),
+                    station_op=str(representative.input_row.station_op or "").strip(),
                     freq=1.0,
-                    norm_key=normalize(representative.operation) or representative.operation,
+                    norm_key=normalize(representative.operation)
+                    or representative.operation,
                 )
                 result = await resolve_with_actor(
                     resolver,
@@ -759,13 +1163,12 @@ async def analyze_excel_bytes(
                     deps,
                     representative.split.actor,
                 )
-
                 for detail in group:
                     detail_element = StdsElement(
                         number=detail.input_row.number,
                         operation_des=detail.operation,
-                        line_name=detail.input_row.line_name,
-                        station_op=detail.input_row.station_op,
+                        line_name=str(detail.input_row.line_name or "").strip(),
+                        station_op=str(detail.input_row.station_op or "").strip(),
                         freq=1.0,
                         norm_key=normalize(detail.operation) or detail.operation,
                     )
@@ -796,33 +1199,77 @@ async def analyze_excel_bytes(
                     operation=detail.operation,
                     affected_rows=1,
                     item_elapsed_s=per_row_elapsed_s,
-                    total_elapsed_s=time.perf_counter() - batch_started,
+                    total_elapsed_s=(
+                        decomposition.total_elapsed_s
+                        + time.perf_counter()
+                        - analysis_batch_started
+                    ),
                     actor=detail.split.actor,
                     sheet_name=detail.input_row.sheet_name,
                     row_index=detail.input_row.row_index,
                     number=detail.input_row.number,
+                    project_name=detail.input_row.project_name,
+                    product_model=detail.input_row.product_model,
+                    line_name=detail.input_row.line_name,
                     station_op=detail.input_row.station_op,
+                    station_description=detail.input_row.station_description,
                     child_index=detail.child_index,
                     child_count=detail.child_count,
                 )
                 timings.append(progress)
-                await notify_progress(progress)
+                await _notify_excel_progress(on_progress, progress)
 
-    await asyncio.gather(
-        *(analyze_group(group) for group in detail_groups.values())
-    )
+    await asyncio.gather(*(analyze_group(group) for group in detail_groups.values()))
     analysis_elapsed_s = time.perf_counter() - analysis_started
-    # 最终展示阶段才翻译，确保工时分析始终使用原始拆解动作。
-    await _translate_output_operations(rows, translator, sem)
-    output_bytes, detail_sheet_name = _write_results(workbook, rows)
-    total_elapsed_s = time.perf_counter() - batch_started
+    final_workbook = load_workbook(
+        BytesIO(decomposition.source_bytes),
+        data_only=False,
+    )
+    output_bytes, detail_sheet_name = _write_results(final_workbook, rows)
+    total_elapsed_s = (
+        decomposition.total_elapsed_s
+        + time.perf_counter()
+        - analysis_batch_started
+    )
     return ExcelBatchOutput(
         output_bytes=output_bytes,
-        output_filename=build_output_filename(source_name),
+        output_filename=build_output_filename(decomposition.source_name),
+        decomposition_bytes=decomposition.decomposition_bytes,
+        decomposition_filename=decomposition.decomposition_filename,
         rows=rows,
         timings=timings,
         total_elapsed_s=total_elapsed_s,
-        decompose_elapsed_s=decompose_elapsed_s,
+        decompose_elapsed_s=decomposition.decompose_elapsed_s,
         analysis_elapsed_s=analysis_elapsed_s,
         detail_sheet_name=detail_sheet_name,
+    )
+
+
+async def analyze_excel_bytes(
+    excel_bytes: bytes,
+    source_name: str,
+    deps: Deps,
+    *,
+    resolver: Resolver = resolve,
+    decomposer: Decomposer = decompose_operation,
+    translator: OutputTranslator = translate_operation_for_output,
+    concurrency: Optional[int] = None,
+    on_progress: Optional[ProgressCallback] = None,
+) -> ExcelBatchOutput:
+    """默认自动模式：拆解和翻译完成后直接进入工时分析。"""
+    decomposition = await decompose_excel_bytes(
+        excel_bytes,
+        source_name,
+        deps,
+        decomposer=decomposer,
+        translator=translator,
+        concurrency=concurrency,
+        on_progress=on_progress,
+    )
+    return await analyze_decomposition_output(
+        decomposition,
+        deps,
+        resolver=resolver,
+        concurrency=concurrency,
+        on_progress=on_progress,
     )

@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 from stds.config.logging_config import setup_logging
@@ -26,17 +27,26 @@ from stds.data.common_chart import load_common_chart
 from stds.llm.client import llm_runtime
 from stds.llm.pick_value import pick_value
 from stds.pipeline.excel_batch import (
+    DECOMPOSITION_HEADERS,
+    LINE_HEADER,
     NUMBER_HEADER,
     OUTPUT_OPERATION_HEADER,
+    PRODUCT_MODEL_HEADER,
+    PROJECT_HEADER,
     STATION_HEADER,
+    STATION_DESCRIPTION_HEADER,
+    TRANSLATED_OPERATION_HEADER,
     ExcelInputError,
     ExcelProgress,
+    analyze_decomposition_output,
     analyze_excel_bytes,
+    decompose_excel_bytes,
+    review_decomposition_rows,
 )
 from stds.pipeline.operation_analysis import OperationAnalysis, analyze_operation
 from stds.review.flywheel import on_review_confirmed
 
-BATCH_OUTPUT_SCHEMA_VERSION = 6
+BATCH_OUTPUT_SCHEMA_VERSION = 9
 COMMON_CHART_SETTING_VERSION = 1
 
 # ---------- 初始化(缓存到 session_state) ----------
@@ -47,8 +57,11 @@ if "charts" not in st.session_state:
     st.session_state.history = []  # 分析历史
 if "batch_output" not in st.session_state:
     st.session_state.batch_output = None
+if "batch_flow" not in st.session_state:
+    st.session_state.batch_flow = {"stage": "idle", "run_id": 0}
 if st.session_state.get("batch_output_schema_version") != BATCH_OUTPUT_SCHEMA_VERSION:
     st.session_state.batch_output = None
+    st.session_state.batch_flow = {"stage": "idle", "run_id": 0}
     st.session_state.batch_output_schema_version = BATCH_OUTPUT_SCHEMA_VERSION
 if "single_output" not in st.session_state:
     st.session_state.single_output = None
@@ -135,40 +148,53 @@ llm_run_signature = (
 )
 
 
-# ========================================
-# 主页:交互式工时分析
-# ========================================
-st.title("⏱️ STDS 工时分析系统")
+def _build_batch_output_payload(batch_result, run_signature, *, input_count=None):
+    """把后端批量结果转换为可跨 Streamlit rerun 保存的展示数据。"""
+    original_count = input_count or batch_result.total_count
+    return {
+        "run_signature": run_signature,
+        "source_digest": run_signature[0],
+        "filename": batch_result.output_filename,
+        "bytes": batch_result.output_bytes,
+        "decomposition_filename": batch_result.decomposition_filename,
+        "decomposition_bytes": batch_result.decomposition_bytes,
+        "preview": batch_result.preview_rows(),
+        "decomposition": batch_result.decomposition_rows(),
+        # Streamlit/PyArrow 不接受同一列同时出现数值和 "NA"；仅展示层转成文本，
+        # 下载工作簿仍保留 Freq/Time(s) 的数值类型和格式。
+        "details": [
+            {
+                key: "" if value is None else str(value)
+                for key, value in row.items()
+            }
+            for row in batch_result.detail_preview_rows()
+        ],
+        "processed": batch_result.processed_count,
+        "review": batch_result.review_count,
+        "failed": batch_result.failed_count,
+        "input_count": original_count,
+        "total_count": batch_result.total_count,
+        "detail_count": batch_result.detail_count,
+        "total_elapsed_s": batch_result.total_elapsed_s,
+        "decompose_elapsed_s": batch_result.decompose_elapsed_s,
+        "analysis_elapsed_s": batch_result.analysis_elapsed_s,
+        "average_elapsed_s": (
+            batch_result.total_elapsed_s / original_count if original_count else 0.0
+        ),
+        "timings": batch_result.timing_rows(),
+        "detail_sheet_name": batch_result.detail_sheet_name,
+        "use_common_chart": run_signature[3],
+        "llm_run_signature": run_signature[2],
+        "manual_review": run_signature[4],
+    }
 
-# ---------- Excel 批量输入 ----------
-st.subheader("📤 Excel 批量分析")
-st.caption(
-    "读取“数据表”的序号/number、工位号/station_op、操作内容/operation 三列；"
-    "系统会先拆解人工动作，再逐条计算工时，并输出固定九列结果。"
-)
-uploaded_file = st.file_uploader(
-    "上传 Excel 文件",
-    type=["xlsx"],
-    help=(
-        "读取数据表前三列：序号/number、工位号/station_op、"
-        "操作内容/operation；后续已有列会被忽略"
-    ),
-)
 
-uploaded_bytes = uploaded_file.getvalue() if uploaded_file is not None else None
-uploaded_digest = hashlib.sha256(uploaded_bytes).hexdigest() if uploaded_bytes else None
-batch_submitted = st.button(
-    "🚀 开始批量分析",
-    type="primary",
-    disabled=uploaded_file is None,
-    key="analyze_excel",
-)
-
-if batch_submitted and uploaded_file is not None:
-    progress_bar = st.progress(0.0)
-    progress_text = st.empty()
-    decomposition_details = st.empty()
-    progress_details = st.empty()
+def _make_batch_progress_callback(
+    progress_bar,
+    progress_text,
+    decomposition_details,
+    progress_details,
+):
     timing_rows = []
     live_decomposition_rows = []
 
@@ -183,8 +209,12 @@ if batch_submitted and uploaded_file is not None:
             for operation in progress.generated_operations:
                 live_decomposition_rows.append(
                     {
-                        NUMBER_HEADER: progress.number,
+                        NUMBER_HEADER: len(live_decomposition_rows) + 1,
+                        PROJECT_HEADER: progress.project_name,
+                        PRODUCT_MODEL_HEADER: progress.product_model,
+                        LINE_HEADER: progress.line_name,
                         STATION_HEADER: progress.station_op,
+                        STATION_DESCRIPTION_HEADER: progress.station_description,
                         OUTPUT_OPERATION_HEADER: operation,
                     }
                 )
@@ -202,6 +232,110 @@ if batch_submitted and uploaded_file is not None:
             height=min(320, 38 + len(timing_rows) * 35),
         )
 
+    return update_batch_progress
+
+
+def _editor_rows(rows):
+    """审核表按文本编辑，避免同一列混合类型导致单元格被锁定。"""
+    return [
+        {
+            header: (
+                row.get(header)
+                if header == NUMBER_HEADER
+                else "" if row.get(header) is None else str(row.get(header))
+            )
+            for header in DECOMPOSITION_HEADERS
+        }
+        for row in rows
+    ]
+
+
+def _records_from_editor(frame: pd.DataFrame) -> list[dict]:
+    records = []
+    for raw_record in frame.to_dict(orient="records"):
+        records.append(
+            {
+                header: (
+                    None
+                    if pd.isna(raw_record.get(header))
+                    else raw_record.get(header)
+                )
+                for header in DECOMPOSITION_HEADERS
+            }
+        )
+    return records
+
+
+# ========================================
+# 主页:交互式工时分析
+# ========================================
+st.title("⏱️ STDS 工时分析系统")
+
+# ---------- Excel 批量输入 ----------
+st.subheader("📤 Excel 批量分析")
+st.caption(
+    "读取“数据表”A:G 的序号、项目名称、产品型号、产线、工位号、"
+    "工位描述、作业描述；系统会保留拆解原文并生成翻译列，最终工时结果只展示翻译后描述。"
+    "开启人工审核后，流程会在拆解和翻译完成时暂停。"
+)
+uploaded_file = st.file_uploader(
+    "上传 Excel 文件",
+    type=["xlsx"],
+    help=(
+        "模板表头依次为：序号、项目名称、产品型号、产线、工位号、"
+        "工位描述、作业描述；分析读取第 G 列“作业描述”"
+    ),
+)
+manual_decomposition_review = st.toggle(
+    "人工审核拆解",
+    key="batch_manual_review",
+    help=(
+        "默认关闭：拆解后直接生成工时结果。开启：拆解和翻译后暂停，"
+        "可在页面编辑、增删并下载拆解表，确认后才进入工时分析。"
+    ),
+)
+
+uploaded_bytes = uploaded_file.getvalue() if uploaded_file is not None else None
+uploaded_digest = hashlib.sha256(uploaded_bytes).hexdigest() if uploaded_bytes else None
+batch_run_signature = (
+    uploaded_digest,
+    uploaded_file.name if uploaded_file is not None else "",
+    llm_run_signature,
+    use_common_chart,
+    manual_decomposition_review,
+)
+review_in_progress = (
+    st.session_state.batch_flow.get("stage") == "editing"
+    and st.session_state.batch_flow.get("run_signature") == batch_run_signature
+)
+batch_submitted = st.button(
+    (
+        "🧩 正在人工审核（请在下方确认）"
+        if review_in_progress
+        else "🧩 拆解并进入人工审核"
+        if manual_decomposition_review
+        else "🚀 开始批量分析"
+    ),
+    type="primary",
+    disabled=uploaded_file is None or review_in_progress,
+    key="analyze_excel",
+)
+
+if batch_submitted and uploaded_file is not None:
+    progress_bar = st.progress(0.0)
+    progress_text = st.empty()
+    decomposition_details = st.empty()
+    progress_details = st.empty()
+    update_batch_progress = _make_batch_progress_callback(
+        progress_bar,
+        progress_text,
+        decomposition_details,
+        progress_details,
+    )
+
+    next_run_id = st.session_state.batch_flow.get("run_id", 0) + 1
+    st.session_state.batch_output = None
+    manual_stage_succeeded = False
     try:
         deps = Deps(
             charts=st.session_state.charts,
@@ -215,69 +349,226 @@ if batch_submitted and uploaded_file is not None:
             model=llm_model_override,
             ollama_base_url=ollama_base_url,
         ):
-            batch_result = asyncio.run(
-                analyze_excel_bytes(
-                    uploaded_bytes,
-                    uploaded_file.name,
-                    deps,
-                    on_progress=update_batch_progress,
+            if manual_decomposition_review:
+                decomposition_result = asyncio.run(
+                    decompose_excel_bytes(
+                        uploaded_bytes,
+                        uploaded_file.name,
+                        deps,
+                        on_progress=update_batch_progress,
+                    )
                 )
-            )
-        st.session_state.batch_output = {
-            "source_digest": uploaded_digest,
-            "filename": batch_result.output_filename,
-            "bytes": batch_result.output_bytes,
-            "preview": batch_result.preview_rows(),
-            "decomposition": batch_result.decomposition_rows(),
-            "details": batch_result.detail_preview_rows(),
-            "processed": batch_result.processed_count,
-            "review": batch_result.review_count,
-            "failed": batch_result.failed_count,
-            "total_count": batch_result.total_count,
-            "detail_count": batch_result.detail_count,
-            "total_elapsed_s": batch_result.total_elapsed_s,
-            "decompose_elapsed_s": batch_result.decompose_elapsed_s,
-            "analysis_elapsed_s": batch_result.analysis_elapsed_s,
-            "average_elapsed_s": batch_result.average_elapsed_s,
-            "timings": batch_result.timing_rows(),
-            "detail_sheet_name": batch_result.detail_sheet_name,
-            "use_common_chart": use_common_chart,
-            "llm_run_signature": llm_run_signature,
-        }
+                st.session_state.batch_flow = {
+                    "stage": "editing",
+                    "run_id": next_run_id,
+                    "run_signature": batch_run_signature,
+                    "stage_result": decomposition_result,
+                    "initial_rows": _editor_rows(
+                        decomposition_result.decomposition_rows()
+                    ),
+                    "edited_rows": _editor_rows(
+                        decomposition_result.decomposition_rows()
+                    ),
+                    "widget_detached": False,
+                    "input_count": decomposition_result.total_count,
+                }
+                manual_stage_succeeded = True
+            else:
+                batch_result = asyncio.run(
+                    analyze_excel_bytes(
+                        uploaded_bytes,
+                        uploaded_file.name,
+                        deps,
+                        on_progress=update_batch_progress,
+                    )
+                )
+                st.session_state.batch_output = _build_batch_output_payload(
+                    batch_result,
+                    batch_run_signature,
+                )
+                st.session_state.batch_flow = {
+                    "stage": "completed",
+                    "run_id": next_run_id,
+                    "run_signature": batch_run_signature,
+                }
     except ExcelInputError as exc:
         st.session_state.batch_output = None
+        st.session_state.batch_flow = {"stage": "idle", "run_id": next_run_id}
         st.error(str(exc))
     except Exception as exc:
         st.session_state.batch_output = None
+        st.session_state.batch_flow = {"stage": "idle", "run_id": next_run_id}
         st.exception(exc)
     finally:
         progress_bar.empty()
         progress_text.empty()
         decomposition_details.empty()
         progress_details.empty()
+    if manual_stage_succeeded:
+        st.rerun()
+
+batch_flow = st.session_state.batch_flow
+if (
+    uploaded_file is not None
+    and batch_flow.get("stage") == "editing"
+    and batch_flow.get("run_signature") == batch_run_signature
+):
+    st.info(
+        "拆解和翻译已完成，工时分析尚未开始。请审核下表；"
+        "可直接修改、增加或删除行，确认后才会进入后续分析。"
+    )
+    st.caption(
+        "第 G 列“作业描述”用于工时分析；第 H 列“翻译后作业描述”用于最终结果。"
+        "若修改 G 列，请同步确认 H 列。序号无需编辑，下载和提交时会按当前行顺序重建。"
+    )
+    editor_frame = pd.DataFrame(
+        batch_flow["initial_rows"],
+        columns=list(DECOMPOSITION_HEADERS),
+    )
+    edited_frame = st.data_editor(
+        editor_frame,
+        key=f"batch_review_editor_{batch_flow['run_id']}",
+        column_order=list(DECOMPOSITION_HEADERS),
+        column_config={
+            NUMBER_HEADER: st.column_config.NumberColumn(
+                NUMBER_HEADER,
+                width="small",
+                help="确认或下载时自动按当前顺序重建",
+            ),
+            STATION_HEADER: st.column_config.TextColumn(
+                STATION_HEADER,
+                required=True,
+            ),
+            OUTPUT_OPERATION_HEADER: st.column_config.TextColumn(
+                OUTPUT_OPERATION_HEADER,
+                width="large",
+                required=True,
+                help="后续工时分析实际使用的内容",
+            ),
+            TRANSLATED_OPERATION_HEADER: st.column_config.TextColumn(
+                TRANSLATED_OPERATION_HEADER,
+                width="large",
+                required=True,
+                help="最终文件 STDS描述 使用的内容",
+            ),
+        },
+        disabled=[NUMBER_HEADER],
+        num_rows="dynamic",
+        hide_index=True,
+        width="stretch",
+        height=min(600, 75 + max(1, len(editor_frame)) * 35),
+    )
+    edited_records = _records_from_editor(edited_frame)
+    batch_flow["edited_rows"] = _editor_rows(edited_records)
+    batch_flow["widget_detached"] = False
+    st.session_state.batch_flow = batch_flow
+    reviewed_stage = None
+    try:
+        reviewed_stage = review_decomposition_rows(
+            batch_flow["stage_result"],
+            edited_records,
+        )
+    except ExcelInputError as exc:
+        st.warning(f"当前审核表尚不能提交：{exc}")
+
+    if reviewed_stage is not None:
+        review_count_col, review_time_col = st.columns(2)
+        review_count_col.metric("当前拆解动作数", reviewed_stage.detail_count)
+        review_time_col.metric(
+            "拆解与翻译耗时",
+            f"{reviewed_stage.decompose_elapsed_s:.2f} 秒",
+        )
+        review_download_col, review_confirm_col = st.columns(2)
+        review_download_col.download_button(
+            "⬇️ 下载当前编辑版 PF 拆解文件（XLSX）",
+            data=reviewed_stage.decomposition_bytes,
+            file_name=reviewed_stage.decomposition_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"batch_review_download_{batch_flow['run_id']}",
+            on_click="ignore",
+        )
+        confirm_review = review_confirm_col.button(
+            "✅ 确认拆解并继续工时分析",
+            type="primary",
+            key=f"batch_review_confirm_{batch_flow['run_id']}",
+        )
+
+        if confirm_review:
+            progress_bar = st.progress(0.5)
+            progress_text = st.empty()
+            decomposition_details = st.empty()
+            progress_details = st.empty()
+            update_batch_progress = _make_batch_progress_callback(
+                progress_bar,
+                progress_text,
+                decomposition_details,
+                progress_details,
+            )
+            analysis_succeeded = False
+            try:
+                deps = Deps(
+                    charts=st.session_state.charts,
+                    cache=st.session_state.cache,
+                    common_rows=st.session_state.common_rows,
+                    use_common_chart=use_common_chart,
+                    llm_pick_value=pick_value,
+                )
+                with llm_runtime(
+                    backend=llm_backend_override,
+                    model=llm_model_override,
+                    ollama_base_url=ollama_base_url,
+                ):
+                    batch_result = asyncio.run(
+                        analyze_decomposition_output(
+                            reviewed_stage,
+                            deps,
+                            on_progress=update_batch_progress,
+                        )
+                    )
+                st.session_state.batch_output = _build_batch_output_payload(
+                    batch_result,
+                    batch_run_signature,
+                    input_count=batch_flow["input_count"],
+                )
+                st.session_state.batch_flow = {
+                    "stage": "completed",
+                    "run_id": batch_flow["run_id"],
+                    "run_signature": batch_run_signature,
+                }
+                analysis_succeeded = True
+            except ExcelInputError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.exception(exc)
+            finally:
+                progress_bar.empty()
+                progress_text.empty()
+                decomposition_details.empty()
+                progress_details.empty()
+            if analysis_succeeded:
+                st.rerun()
 
 batch_output = st.session_state.batch_output
 if (
     uploaded_file is not None
     and batch_output is not None
-    and batch_output["source_digest"] == uploaded_digest
-    and batch_output["use_common_chart"] == use_common_chart
-    and batch_output["llm_run_signature"] == llm_run_signature
+    and batch_output["run_signature"] == batch_run_signature
 ):
     if batch_output["failed"] or batch_output["review"]:
         st.warning(
-            f"已处理 {batch_output['processed']} 条，待复核 {batch_output['review']} 条，"
-            f"失败 {batch_output['failed']} 条；原因已写入 trace 列。"
+            f"已分析 {batch_output['processed']} 条拆解动作，"
+            f"待复核 {batch_output['review']} 条，"
+            f"失败 {batch_output['failed']} 条；原因可在下方分析行汇总中查看。"
         )
     else:
         st.success(
-            f"已完成 {batch_output['processed']} 条原始 operation，"
-            f"共得到 {batch_output['detail_count']} 条拆解动作"
+            f"已完成 {batch_output['input_count']} 条原始作业描述，"
+            f"最终采用 {batch_output['detail_count']} 条拆解动作"
         )
 
     total_col, detail_col, elapsed_col, average_col = st.columns(4)
-    total_col.metric("原始条数", batch_output["total_count"])
-    detail_col.metric("拆解后条数", batch_output["detail_count"])
+    total_col.metric("原始条数", batch_output["input_count"])
+    detail_col.metric("最终拆解动作数", batch_output["detail_count"])
     elapsed_col.metric("总耗时", f"{batch_output['total_elapsed_s']:.2f} 秒")
     average_col.metric("平均每个原始动作", f"{batch_output['average_elapsed_s']:.2f} 秒")
 
@@ -285,18 +576,30 @@ if (
     phase_col1.metric("拆解阶段耗时", f"{batch_output['decompose_elapsed_s']:.2f} 秒")
     phase_col2.metric("工时分析阶段耗时", f"{batch_output['analysis_elapsed_s']:.2f} 秒")
 
-    st.download_button(
-        "⬇️ 下载完整结果（XLSX）",
+    decomposition_download_col, result_download_col = st.columns(2)
+    decomposition_download_col.download_button(
+        (
+            "⬇️ 下载已审核 PF 拆解文件（XLSX）"
+            if batch_output["manual_review"]
+            else "⬇️ 下载 PF 拆解文件（XLSX）"
+        ),
+        data=batch_output["decomposition_bytes"],
+        file_name=batch_output["decomposition_filename"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    result_download_col.download_button(
+        "⬇️ 下载工时结果（XLSX）",
         data=batch_output["bytes"],
         file_name=batch_output["filename"],
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
     )
     st.caption(
-        "上方按钮下载完整 XLSX；表格右上角的“Download as CSV”是 Streamlit 自带的当前表格导出。"
+        "拆解文件为原七列 PF 格式加“翻译后作业描述”；"
+        "工时结果为 A:N 十四列，STDS描述仅展示翻译结果。"
     )
 
-    with st.expander("🧩 拆解中间结果", expanded=True):
+    with st.expander("🧩 最终采用的拆解结果", expanded=True):
         st.dataframe(
             batch_output["decomposition"],
             hide_index=True,
@@ -317,9 +620,13 @@ if (
             width="stretch",
         )
 
-    with st.expander("📊 原始 Excel 行汇总", expanded=False):
+    with st.expander("📊 分析行汇总", expanded=False):
         st.dataframe(batch_output["preview"], hide_index=True, width="stretch")
     st.caption(f"下载结果中的逐条拆解与工时明细位于“{batch_output['detail_sheet_name']}”工作表。")
+    st.caption(
+        "本次拆解人工审核："
+        f"{'已开启并确认' if batch_output['manual_review'] else '未开启'}"
+    )
     st.caption(
         "本次分析的 T0.5 Common Chart："
         f"{'已启用' if batch_output['use_common_chart'] else '已关闭'}"
@@ -337,7 +644,30 @@ elif (
     and batch_output is not None
     and batch_output["source_digest"] == uploaded_digest
 ):
-    st.info("分析设置已变化，请重新点击“开始批量分析”。")
+    st.info("分析设置已变化，请重新开始本次批量流程。")
+
+if (
+    batch_flow.get("stage") == "editing"
+    and batch_flow.get("run_signature") != batch_run_signature
+):
+    if not batch_flow.get("widget_detached"):
+        batch_flow["initial_rows"] = batch_flow.get(
+            "edited_rows",
+            batch_flow["initial_rows"],
+        )
+        batch_flow["run_id"] += 1
+        batch_flow["widget_detached"] = True
+        st.session_state.batch_flow = batch_flow
+    if batch_flow.get("run_signature", (None,))[0] == uploaded_digest:
+        st.info(
+            "分析设置已变化，审核已暂停；切回原设置可继续，"
+            "也可以重新开始本次批量流程。"
+        )
+    else:
+        st.info(
+            "上传文件已变化，原文件的审核内容已暂存；重新上传原文件可继续，"
+            "也可以用当前文件重新开始本次批量流程。"
+        )
 
 st.divider()
 st.subheader("✍️ 单条分析（可选）")

@@ -125,6 +125,24 @@ async def _notify(callback: Optional[Callable], *args) -> None:
         logger.debug("Operation analysis callback failed", exc_info=True)
 
 
+async def classify_operation_actor(
+    operation: str,
+    deps: Deps,
+) -> tuple[str, str]:
+    """只判定动作主体，不执行拆解；供初始拆解与人工审核后的新增动作共用。"""
+    machine = rules.rule_machine(operation)
+    classify_source = "规则判定"
+    if machine is None:
+        classifier = getattr(deps, "llm_classify", None)
+        if classifier is None:
+            machine = False
+            classify_source = "未配置分类器，按人工"
+        else:
+            machine = await classifier(operation)
+            classify_source = "LLM判定"
+    return ("设备" if machine else "人工"), classify_source
+
+
 async def split_operation(
     operation: str,
     deps: Deps,
@@ -139,18 +157,9 @@ async def split_operation(
         needs_review=True,
     )
     try:
-        machine = rules.rule_machine(operation)
-        classify_source = "规则判定"
-        if machine is None:
-            classifier = getattr(deps, "llm_classify", None)
-            if classifier is None:
-                machine = False
-                classify_source = "未配置分类器，按人工"
-            else:
-                machine = await classifier(operation)
-                classify_source = "LLM判定"
+        actor, classify_source = await classify_operation_actor(operation, deps)
 
-        if machine:
+        if actor == "设备":
             return OperationSplit(
                 actor="设备",
                 operations=(operation,),
