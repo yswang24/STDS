@@ -8,6 +8,7 @@ import json
 import logging
 import time
 import unicodedata
+import zipfile
 from dataclasses import dataclass, replace
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -88,6 +89,10 @@ INPUT_HEADER_ALIASES = {
 PHASE_DECOMPOSE = "拆解"
 PHASE_ANALYZE = "工时分析"
 PENDING_REVIEW_ACTOR = "待判定"
+MAX_REVIEW_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_REVIEW_XLSX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
+MAX_REVIEW_XLSX_ENTRIES = 2000
+MAX_REVIEW_ROWS = 100_000
 
 
 class ExcelInputError(ValueError):
@@ -927,6 +932,160 @@ def _clean_review_value(value: object) -> object:
     if _is_blank_review_value(value):
         return None
     return value.strip() if isinstance(value, str) else value
+
+
+def _validate_review_upload_headers(values: Sequence[object]) -> None:
+    actual_headers = tuple(_clean_header(value) for value in values)
+    if actual_headers != DECOMPOSITION_HEADERS:
+        raise ExcelInputError(
+            "人工审核拆解文件第 1 行必须依次为："
+            + "、".join(DECOMPOSITION_HEADERS)
+        )
+
+
+def _restore_review_csv_text(value: str) -> str:
+    if len(value) >= 2 and value[0] == "'" and value[1] in ("=", "+", "-", "@"):
+        return value[1:]
+    return value
+
+
+def parse_decomposition_review_upload(
+    file_bytes: bytes,
+    filename: str,
+) -> list[dict[str, object]]:
+    """读取线下修改后的八列审核版 XLSX/CSV，返回 canonical records。"""
+    if not file_bytes:
+        raise ExcelInputError("上传的人工审核拆解文件为空")
+    if len(file_bytes) > MAX_REVIEW_UPLOAD_BYTES:
+        raise ExcelInputError("人工审核拆解文件不能超过 20 MB")
+
+    suffix = Path(filename or "").suffix.casefold()
+    if suffix == ".xlsx":
+        try:
+            with zipfile.ZipFile(BytesIO(file_bytes)) as archive:
+                entries = archive.infolist()
+                if len(entries) > MAX_REVIEW_XLSX_ENTRIES:
+                    raise ExcelInputError("人工审核 XLSX 包含过多内部文件")
+                if (
+                    sum(entry.file_size for entry in entries)
+                    > MAX_REVIEW_XLSX_UNCOMPRESSED_BYTES
+                ):
+                    raise ExcelInputError("人工审核 XLSX 解压后不能超过 100 MB")
+            workbook = load_workbook(
+                BytesIO(file_bytes),
+                data_only=False,
+                read_only=False,
+            )
+        except ExcelInputError:
+            raise
+        except Exception as exc:
+            raise ExcelInputError(
+                "无法读取人工审核拆解文件，请确认它是有效的 .xlsx 工作簿"
+            ) from exc
+        try:
+            if INPUT_SHEET_NAME not in workbook.sheetnames:
+                raise ExcelInputError(
+                    f"人工审核拆解文件缺少“{INPUT_SHEET_NAME}”工作表"
+                )
+            ws = workbook[INPUT_SHEET_NAME]
+            if ws.max_row > MAX_REVIEW_ROWS + 1:
+                raise ExcelInputError(
+                    f"人工审核拆解文件最多支持 {MAX_REVIEW_ROWS} 条动作"
+                )
+            _validate_review_upload_headers(
+                [
+                    ws.cell(1, column).value
+                    for column in range(1, len(DECOMPOSITION_HEADERS) + 1)
+                ]
+            )
+            if any(
+                not _is_blank_review_value(ws.cell(1, column).value)
+                for column in range(
+                    len(DECOMPOSITION_HEADERS) + 1,
+                    ws.max_column + 1,
+                )
+            ):
+                raise ExcelInputError("人工审核拆解文件表头只能包含 A:H 八列")
+
+            records = []
+            for row_index in range(2, ws.max_row + 1):
+                cells = [
+                    ws.cell(row_index, column)
+                    for column in range(1, len(DECOMPOSITION_HEADERS) + 1)
+                ]
+                extra_values = [
+                    ws.cell(row_index, column).value
+                    for column in range(
+                        len(DECOMPOSITION_HEADERS) + 1,
+                        ws.max_column + 1,
+                    )
+                ]
+                if any(
+                    not _is_blank_review_value(value)
+                    for value in extra_values
+                ):
+                    raise ExcelInputError(
+                        f"人工审核拆解文件第 {row_index} 行包含 A:H 之外的数据"
+                    )
+                if all(_is_blank_review_value(cell.value) for cell in cells):
+                    continue
+                for column, cell in enumerate(cells, start=1):
+                    if cell.data_type == "f":
+                        raise ExcelInputError(
+                            f"人工审核拆解文件第 {row_index} 行"
+                            f"第 {get_column_letter(column)} 列不能使用公式"
+                        )
+                records.append(
+                    {
+                        header: cell.value
+                        for header, cell in zip(DECOMPOSITION_HEADERS, cells)
+                    }
+                )
+        finally:
+            workbook.close()
+    elif suffix == ".csv":
+        try:
+            text = file_bytes.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ExcelInputError(
+                "人工审核 CSV 必须使用 UTF-8 编码"
+            ) from exc
+        try:
+            csv_rows = csv.reader(StringIO(text))
+            header_row = next(csv_rows)
+            _validate_review_upload_headers(header_row)
+            records = []
+            for row_index, values in enumerate(csv_rows, start=2):
+                if not values or all(_is_blank_review_value(value) for value in values):
+                    continue
+                if len(values) != len(DECOMPOSITION_HEADERS):
+                    raise ExcelInputError(
+                        f"人工审核 CSV 第 {row_index} 行必须正好包含八列"
+                    )
+                if len(records) >= MAX_REVIEW_ROWS:
+                    raise ExcelInputError(
+                        f"人工审核拆解文件最多支持 {MAX_REVIEW_ROWS} 条动作"
+                    )
+                records.append(
+                    {
+                        header: _restore_review_csv_text(value)
+                        for header, value in zip(DECOMPOSITION_HEADERS, values)
+                    }
+                )
+        except (StopIteration, csv.Error) as exc:
+            raise ExcelInputError("无法读取人工审核 CSV 文件") from exc
+    else:
+        raise ExcelInputError("人工审核拆解文件仅支持 .xlsx 或 .csv")
+
+    if not any(
+        not all(
+            _is_blank_review_value(record.get(header))
+            for header in DECOMPOSITION_HEADERS[1:]
+        )
+        for record in records
+    ):
+        raise ExcelInputError("人工审核拆解文件中没有可解析的动作")
+    return records
 
 
 def _review_actor(

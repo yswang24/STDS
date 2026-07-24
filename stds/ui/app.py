@@ -41,12 +41,18 @@ from stds.pipeline.excel_batch import (
     analyze_decomposition_output,
     analyze_excel_bytes,
     decompose_excel_bytes,
+    parse_decomposition_review_upload,
     review_decomposition_rows,
 )
 from stds.pipeline.operation_analysis import OperationAnalysis, analyze_operation
 from stds.review.flywheel import on_review_confirmed
+from stds.ui.review_table import (
+    delete_review_editor_rows,
+    insert_review_editor_row,
+    normalize_review_editor_rows,
+)
 
-BATCH_OUTPUT_SCHEMA_VERSION = 11
+BATCH_OUTPUT_SCHEMA_VERSION = 12
 COMMON_CHART_SETTING_VERSION = 1
 
 # ---------- 初始化(缓存到 session_state) ----------
@@ -247,17 +253,7 @@ def _make_batch_progress_callback(
 
 def _editor_rows(rows):
     """审核表按文本编辑，避免同一列混合类型导致单元格被锁定。"""
-    return [
-        {
-            header: (
-                row.get(header)
-                if header == NUMBER_HEADER
-                else "" if row.get(header) is None else str(row.get(header))
-            )
-            for header in DECOMPOSITION_HEADERS
-        }
-        for row in rows
-    ]
+    return normalize_review_editor_rows(rows)
 
 
 def _records_from_editor(frame: pd.DataFrame) -> list[dict]:
@@ -274,6 +270,23 @@ def _records_from_editor(frame: pd.DataFrame) -> list[dict]:
             }
         )
     return records
+
+
+def _replace_review_editor_rows(
+    batch_flow: dict,
+    rows,
+    *,
+    notice: str,
+) -> None:
+    """替换审核数据并更换编辑器 key，确保上传/行操作立即反映到页面。"""
+    normalized_rows = _editor_rows(rows)
+    batch_flow["initial_rows"] = normalized_rows
+    batch_flow["edited_rows"] = normalized_rows
+    batch_flow["editor_revision"] = batch_flow.get("editor_revision", 0) + 1
+    batch_flow["review_notice"] = notice
+    batch_flow["widget_detached"] = False
+    st.session_state.batch_output = None
+    st.session_state.batch_flow = batch_flow
 
 
 # ========================================
@@ -379,6 +392,7 @@ if batch_submitted and uploaded_file is not None:
                     "edited_rows": _editor_rows(
                         decomposition_result.decomposition_rows()
                     ),
+                    "editor_revision": 0,
                     "widget_detached": False,
                     "input_count": decomposition_result.total_count,
                 }
@@ -429,16 +443,65 @@ if (
     )
     st.caption(
         "第 G 列“作业描述”用于工时分析；第 H 列“翻译后作业描述”用于最终结果。"
-        "若修改 G 列，请同步确认 H 列。序号无需编辑，下载和提交时会按当前行顺序重建。"
+        "若修改 G 列，请同步确认 H 列。序号无需编辑，增删、上传、下载和提交时"
+        "都会按当前行顺序自动重建。"
         "请使用表格下方的 CSV/XLSX 按钮下载，两种格式使用同一份规范化数据。"
     )
+    if notice := batch_flow.pop("review_notice", None):
+        st.success(notice)
+        st.session_state.batch_flow = batch_flow
+
+    editor_revision = batch_flow.get("editor_revision", 0)
+    with st.expander("📤 上传线下修改后的 PF 拆解文件", expanded=False):
+        st.caption(
+            "可上传本页面下载的 XLSX 或 CSV 审核版。上传内容会先校验八列表头、"
+            "必填字段和动作数量，确认载入后替换当前页面审核表。"
+        )
+        reviewed_upload = st.file_uploader(
+            "选择修改后的拆解文件",
+            type=["xlsx", "csv"],
+            key=(
+                f"batch_review_upload_{batch_flow['run_id']}_"
+                f"{editor_revision}"
+            ),
+        )
+        load_review_upload = st.button(
+            "载入上传文件到审核表",
+            disabled=reviewed_upload is None,
+            key=(
+                f"batch_review_upload_apply_{batch_flow['run_id']}_"
+                f"{editor_revision}"
+            ),
+        )
+        if load_review_upload and reviewed_upload is not None:
+            try:
+                uploaded_records = parse_decomposition_review_upload(
+                    reviewed_upload.getvalue(),
+                    reviewed_upload.name,
+                )
+                uploaded_stage = review_decomposition_rows(
+                    batch_flow["stage_result"],
+                    uploaded_records,
+                )
+                _replace_review_editor_rows(
+                    batch_flow,
+                    uploaded_stage.decomposition_rows(),
+                    notice=(
+                        f"已载入“{reviewed_upload.name}”，"
+                        f"共 {uploaded_stage.detail_count} 条拆解动作。"
+                    ),
+                )
+                st.rerun()
+            except ExcelInputError as exc:
+                st.error(f"无法载入审核文件：{exc}")
+
     editor_frame = pd.DataFrame(
         batch_flow["initial_rows"],
         columns=list(DECOMPOSITION_HEADERS),
     )
     edited_frame = st.data_editor(
         editor_frame,
-        key=f"batch_review_editor_{batch_flow['run_id']}",
+        key=f"batch_review_editor_{batch_flow['run_id']}_{editor_revision}",
         column_order=list(DECOMPOSITION_HEADERS),
         column_config={
             NUMBER_HEADER: st.column_config.NumberColumn(
@@ -470,9 +533,101 @@ if (
         height=min(600, 75 + max(1, len(editor_frame)) * 35),
     )
     edited_records = _records_from_editor(edited_frame)
+    displayed_numbers = [
+        record.get(NUMBER_HEADER)
+        for record in edited_records
+    ]
+    expected_numbers = list(range(1, len(edited_records) + 1))
+    if displayed_numbers != expected_numbers:
+        _replace_review_editor_rows(
+            batch_flow,
+            edited_records,
+            notice="已按当前行顺序自动更新序号。",
+        )
+        st.rerun()
     batch_flow["edited_rows"] = _editor_rows(edited_records)
     batch_flow["widget_detached"] = False
     st.session_state.batch_flow = batch_flow
+
+    st.markdown("**页面行操作**")
+    st.caption(
+        "表格底部仍可直接追加行；如需在中间插入或批量删除，请使用以下控件。"
+        "新插入行会复制相邻行的项目、产线和工位信息，作业描述留空等待填写。"
+    )
+    insert_position_col, insert_button_col = st.columns([3, 1])
+    with insert_position_col:
+        insert_position = st.number_input(
+            "插入位置",
+            min_value=1,
+            max_value=len(edited_records) + 1,
+            value=len(edited_records) + 1,
+            step=1,
+            help="填写 1 表示插入到第一行之前；最大值表示追加到末尾。",
+            key=(
+                f"batch_review_insert_position_{batch_flow['run_id']}_"
+                f"{editor_revision}"
+            ),
+        )
+    with insert_button_col:
+        st.write("")
+        insert_review_row = st.button(
+            "➕ 插入新行",
+            key=(
+                f"batch_review_insert_{batch_flow['run_id']}_"
+                f"{editor_revision}"
+            ),
+            use_container_width=True,
+        )
+
+    row_labels = {
+        index: (
+            f"第 {index} 行｜"
+            f"{record.get(STATION_HEADER) or '无工位'}｜"
+            f"{str(record.get(OUTPUT_OPERATION_HEADER) or '空白动作')[:40]}"
+        )
+        for index, record in enumerate(edited_records, start=1)
+    }
+    delete_selection_col, delete_button_col = st.columns([3, 1])
+    with delete_selection_col:
+        delete_positions = st.multiselect(
+            "选择要删除的行",
+            options=list(row_labels),
+            format_func=lambda position: row_labels[position],
+            key=(
+                f"batch_review_delete_positions_{batch_flow['run_id']}_"
+                f"{editor_revision}"
+            ),
+        )
+    with delete_button_col:
+        st.write("")
+        delete_review_rows = st.button(
+            "🗑️ 删除选中行",
+            disabled=not delete_positions,
+            key=(
+                f"batch_review_delete_{batch_flow['run_id']}_"
+                f"{editor_revision}"
+            ),
+            use_container_width=True,
+        )
+
+    if insert_review_row:
+        _replace_review_editor_rows(
+            batch_flow,
+            insert_review_editor_row(
+                edited_records,
+                int(insert_position),
+            ),
+            notice=f"已在第 {int(insert_position)} 行位置插入新动作。",
+        )
+        st.rerun()
+    if delete_review_rows:
+        _replace_review_editor_rows(
+            batch_flow,
+            delete_review_editor_rows(edited_records, delete_positions),
+            notice=f"已删除 {len(delete_positions)} 行，序号已重新生成。",
+        )
+        st.rerun()
+
     reviewed_stage = None
     try:
         reviewed_stage = review_decomposition_rows(
