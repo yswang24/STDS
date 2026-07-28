@@ -9,7 +9,13 @@ from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Optional, Sequence
 
 from stds.cascade import rules
-from stds.cascade.resolver import Deps, resolve
+from stds.cascade.numeric import NumericContext
+from stds.cascade.resolver import (
+    Deps,
+    PartWeightGroupResolution,
+    resolve,
+    resolve_part_weight_groups,
+)
 from stds.cascade.rules import normalize
 from stds.domain.models import Source, StdsElement, StdsResult
 from stds.llm.decompose import decompose_operation
@@ -233,20 +239,29 @@ async def resolve_with_actor(
     element: StdsElement,
     deps: Deps,
     actor: str,
+    *,
+    numeric_context: Optional[NumericContext] = None,
+    part_context_resolved: bool = False,
 ) -> StdsResult:
-    """调用支持 machine_hint 的解析器，同时兼容旧的二参数测试解析器。"""
+    """按解析器签名传递可用上下文，同时兼容旧的二参数测试解析器。"""
     try:
-        parameters = inspect.signature(resolver).parameters.values()
-        accepts_hint = any(
-            parameter.name == "machine_hint"
-            or parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters
+        parameters = inspect.signature(resolver).parameters
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
         )
     except (TypeError, ValueError):
-        accepts_hint = False
-    if accepts_hint:
-        return await resolver(element, deps, machine_hint=actor == "设备")
-    return await resolver(element, deps)
+        parameters = {}
+        accepts_kwargs = False
+
+    kwargs = {}
+    if accepts_kwargs or "machine_hint" in parameters:
+        kwargs["machine_hint"] = actor == "设备"
+    if accepts_kwargs or "numeric_context" in parameters:
+        kwargs["numeric_context"] = numeric_context
+    if accepts_kwargs or "part_context_resolved" in parameters:
+        kwargs["part_context_resolved"] = part_context_resolved
+    return await resolver(element, deps, **kwargs)
 
 
 async def analyze_operation(
@@ -267,6 +282,15 @@ async def analyze_operation(
     started = time.perf_counter()
     decompose_started = time.perf_counter()
     split = await split_operation(operation, deps, decomposer=decomposer)
+    weight_resolution = (
+        await resolve_part_weight_groups(
+            operation,
+            split.operations,
+            deps,
+        )
+        if split.actor == "人工"
+        else PartWeightGroupResolution()
+    )
     unique_operations = tuple(dict.fromkeys(split.operations))
     translated_operations = await asyncio.gather(
         *(
@@ -305,7 +329,14 @@ async def analyze_operation(
                 freq=freq,
                 norm_key=normalize(child) or child,
             )
-            item.result = await resolve_with_actor(resolver, element, deps, split.actor)
+            item.result = await resolve_with_actor(
+                resolver,
+                element,
+                deps,
+                split.actor,
+                numeric_context=weight_resolution.contexts.get(index),
+                part_context_resolved=weight_resolution.attempted,
+            )
         except Exception as exc:
             logger.exception("Operation child analysis failed: operation=%r", child)
             item.error = f"{type(exc).__name__}: {exc}"

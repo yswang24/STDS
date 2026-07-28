@@ -19,7 +19,12 @@ from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 from stds.cascade import rules
-from stds.cascade.resolver import Deps, resolve
+from stds.cascade.resolver import (
+    Deps,
+    PartWeightGroupResolution,
+    resolve,
+    resolve_part_weight_groups,
+)
 from stds.cascade.rules import normalize
 from stds.config.settings import settings
 from stds.domain.models import Source, StdsElement, StdsResult
@@ -1206,6 +1211,82 @@ def review_decomposition_rows(
     if not reviewed_rows:
         raise ExcelInputError("人工审核表至少需要保留一条拆解动作")
 
+    # 页面“确认但未修改”时恢复原父子边界，否则每个审核行会退化成独立父工序，
+    # 同一父工序下的共享重量上下文就会丢失。发生增删、改写或重排时不猜边界。
+    original_details = [
+        detail
+        for row in decomposition.rows
+        for detail in row.details
+    ]
+    reviewed_details = [
+        row.details[0]
+        for row in reviewed_rows
+    ]
+    preserve_parent_boundaries = (
+        len(original_details) == len(reviewed_details)
+        and all(
+            original.decomposition_values()[1:]
+            == reviewed.decomposition_values()[1:]
+            for original, reviewed in zip(
+                original_details,
+                reviewed_details,
+            )
+        )
+    )
+    if preserve_parent_boundaries:
+        regrouped_rows = []
+        cursor = 0
+        for original_row in decomposition.rows:
+            child_count = len(original_row.details)
+            child_rows = reviewed_rows[cursor : cursor + child_count]
+            cursor += child_count
+            child_details = [row.details[0] for row in child_rows]
+            actors = {detail.split.actor for detail in child_details}
+            actor = (
+                next(iter(actors))
+                if len(actors) == 1
+                else PENDING_REVIEW_ACTOR
+            )
+            shared_split = OperationSplit(
+                actor=actor,
+                operations=tuple(
+                    detail.operation for detail in child_details
+                ),
+                source=child_details[0].split.source,
+                needs_review=any(
+                    detail.split.needs_review for detail in child_details
+                ),
+                error=next(
+                    (
+                        detail.split.error
+                        for detail in child_details
+                        if detail.split.error
+                    ),
+                    None,
+                ),
+                display_operations=tuple(
+                    detail.output_operation for detail in child_details
+                ),
+            )
+            regrouped_rows.append(
+                ExcelRowResult(
+                    input_row=original_row.input_row,
+                    split=shared_split,
+                    details=[
+                        replace(
+                            detail,
+                            split=shared_split,
+                            child_index=index,
+                        )
+                        for index, detail in enumerate(
+                            child_details,
+                            start=1,
+                        )
+                    ],
+                )
+            )
+        reviewed_rows = regrouped_rows
+
     workbook = load_workbook(BytesIO(decomposition.source_bytes), data_only=False)
     decomposition_bytes, _ = _write_decomposition(workbook, reviewed_rows)
     return replace(
@@ -1273,6 +1354,46 @@ async def _classify_pending_review_actors(
             row.split = row.details[0].split
 
 
+async def _resolve_parent_weight_groups(
+    rows: list[ExcelRowResult],
+    deps: Deps,
+    sem: asyncio.Semaphore,
+) -> dict[int, PartWeightGroupResolution]:
+    """按父工序签名只解析一次重量组，并共享给该父工序的全部子工序。"""
+    resolutions = {
+        id(row): PartWeightGroupResolution()
+        for row in rows
+    }
+    grouped_rows: dict[tuple, list[ExcelRowResult]] = {}
+    for row in rows:
+        if row.split.actor != "人工":
+            continue
+        signature = (
+            normalize(row.input_row.operation) or row.input_row.operation,
+            tuple(
+                normalize(detail.operation) or detail.operation
+                for detail in row.details
+            ),
+        )
+        grouped_rows.setdefault(signature, []).append(row)
+
+    async def resolve_group(group: list[ExcelRowResult]) -> None:
+        representative = group[0]
+        async with sem:
+            resolution = await resolve_part_weight_groups(
+                representative.input_row.operation,
+                tuple(detail.operation for detail in representative.details),
+                deps,
+            )
+        for row in group:
+            resolutions[id(row)] = resolution
+
+    await asyncio.gather(
+        *(resolve_group(group) for group in grouped_rows.values())
+    )
+    return resolutions
+
+
 async def analyze_decomposition_output(
     decomposition: ExcelDecompositionOutput,
     deps: Deps,
@@ -1288,19 +1409,47 @@ async def analyze_decomposition_output(
     sem = asyncio.Semaphore(max(1, concurrency or settings.CONCURRENCY_LIMIT))
     analysis_started = time.perf_counter()
     await _classify_pending_review_actors(rows, deps, sem)
+    parent_weight_resolutions = await _resolve_parent_weight_groups(
+        rows,
+        deps,
+        sem,
+    )
 
-    # 不做去重:每个明细(detail)单独作为一个并发单元,按行逐一分析,
-    # 这样并发数由明细行数决定,而非唯一(actor, 操作)组合数。
-    detail_units: list[list[ExcelDetailResult]] = []
+    # 相同动作只有在“父重量解析作用域 + 当前重量上下文”也一致时才复用。
+    # 这样既保留原有跨行去重，又不会把不同父工序/不同零件的重量串在一起。
+    grouped_detail_units: dict[
+        tuple,
+        tuple[list[ExcelDetailResult], PartWeightGroupResolution],
+    ] = {}
     for row in rows:
+        weight_resolution = parent_weight_resolutions[id(row)]
         for detail in row.details:
-            detail_units.append([detail])
+            numeric_context = weight_resolution.contexts.get(detail.child_index)
+            key = (
+                detail.split.actor,
+                normalize(detail.operation) or detail.operation,
+                (
+                    id(weight_resolution)
+                    if weight_resolution.attempted
+                    else None
+                ),
+                id(numeric_context) if numeric_context is not None else None,
+            )
+            unit = grouped_detail_units.get(key)
+            if unit is None:
+                grouped_detail_units[key] = ([detail], weight_resolution)
+            else:
+                unit[0].append(detail)
+    detail_units = list(grouped_detail_units.values())
 
     analysis_completed = 0
-    total_details = sum(len(unit) for unit in detail_units)
+    total_details = sum(len(group) for group, _ in detail_units)
 
-    async def analyze_group(group: list[ExcelDetailResult]) -> None:
+    async def analyze_group(
+        unit: tuple[list[ExcelDetailResult], PartWeightGroupResolution],
+    ) -> None:
         nonlocal analysis_completed
+        group, weight_resolution = unit
         representative = group[0]
         item_started: Optional[float] = None
         try:
@@ -1320,6 +1469,10 @@ async def analyze_decomposition_output(
                     element,
                     deps,
                     representative.split.actor,
+                    numeric_context=weight_resolution.contexts.get(
+                        representative.child_index
+                    ),
+                    part_context_resolved=weight_resolution.attempted,
                 )
                 for detail in group:
                     detail_element = StdsElement(

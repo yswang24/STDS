@@ -24,6 +24,7 @@ from stds.cascade.resolver import Deps
 from stds.data.cache import AutoCache
 from stds.data.charts_loader import load_charts
 from stds.data.common_chart import load_common_chart
+from stds.experience import load_experience_workbook
 from stds.llm.client import llm_runtime
 from stds.llm.pick_value import pick_value
 from stds.pipeline.excel_batch import (
@@ -45,6 +46,7 @@ from stds.pipeline.excel_batch import (
     review_decomposition_rows,
 )
 from stds.pipeline.operation_analysis import OperationAnalysis, analyze_operation
+from stds.retrieval.part_weight_index import load_part_weight_index
 from stds.review.flywheel import on_review_confirmed
 from stds.ui.review_table import (
     delete_review_editor_rows,
@@ -52,7 +54,7 @@ from stds.ui.review_table import (
     normalize_review_editor_rows,
 )
 
-BATCH_OUTPUT_SCHEMA_VERSION = 12
+BATCH_OUTPUT_SCHEMA_VERSION = 15
 COMMON_CHART_SETTING_VERSION = 1
 
 # ---------- 初始化(缓存到 session_state) ----------
@@ -61,6 +63,8 @@ if "charts" not in st.session_state:
     st.session_state.cache = AutoCache()
     st.session_state.common_rows = load_common_chart()
     st.session_state.history = []  # 分析历史
+if "part_weight_index" not in st.session_state:
+    st.session_state.part_weight_index = load_part_weight_index()
 if "batch_output" not in st.session_state:
     st.session_state.batch_output = None
 if "batch_flow" not in st.session_state:
@@ -72,6 +76,11 @@ if st.session_state.get("batch_output_schema_version") != BATCH_OUTPUT_SCHEMA_VE
 if "single_output" not in st.session_state:
     st.session_state.single_output = None
     st.session_state.single_run_id = 0
+if "experience_load_key" not in st.session_state:
+    st.session_state.experience_load_key = None
+    st.session_state.experience_load_result = None
+    st.session_state.experience_load_error = ""
+    st.session_state.active_experience_digest = None
 if st.session_state.get("common_chart_setting_version") != COMMON_CHART_SETTING_VERSION:
     st.session_state.use_common_chart = False
     st.session_state.common_chart_setting_version = COMMON_CHART_SETTING_VERSION
@@ -202,6 +211,8 @@ def _build_batch_output_payload(batch_result, run_signature, *, input_count=None
         "use_common_chart": run_signature[3],
         "llm_run_signature": run_signature[2],
         "manual_review": run_signature[4],
+        "experience_digest": run_signature[5],
+        "experience_filename": run_signature[6],
     }
 
 
@@ -309,6 +320,15 @@ uploaded_file = st.file_uploader(
         "工位描述、作业描述；分析读取第 G 列“作业描述”"
     ),
 )
+experience_file = st.file_uploader(
+    "上传 STDS 评估经验文件（可选）",
+    type=["xlsx"],
+    key="stds_experience_workbook",
+    help=(
+        "支持 STDS评估经验V1.2.xlsx：系统会按“动作经验身份 + Chartcode”"
+        "绑定参数经验；不上传时完全沿用原分析逻辑。"
+    ),
+)
 manual_decomposition_review = st.toggle(
     "人工审核拆解",
     key="batch_manual_review",
@@ -320,12 +340,91 @@ manual_decomposition_review = st.toggle(
 
 uploaded_bytes = uploaded_file.getvalue() if uploaded_file is not None else None
 uploaded_digest = hashlib.sha256(uploaded_bytes).hexdigest() if uploaded_bytes else None
+experience_bytes = (
+    experience_file.getvalue() if experience_file is not None else None
+)
+experience_digest = (
+    hashlib.sha256(experience_bytes).hexdigest() if experience_bytes else None
+)
+experience_load_key = (
+    experience_digest,
+    experience_file.name if experience_file is not None else "",
+)
+if experience_file is None:
+    st.session_state.experience_load_key = None
+    st.session_state.experience_load_result = None
+    st.session_state.experience_load_error = ""
+elif st.session_state.experience_load_key != experience_load_key:
+    try:
+        st.session_state.experience_load_result = load_experience_workbook(
+            experience_bytes,
+            st.session_state.charts,
+            source_name=experience_file.name,
+        )
+        st.session_state.experience_load_error = ""
+    except Exception as exc:
+        st.session_state.experience_load_result = None
+        st.session_state.experience_load_error = str(exc)
+    st.session_state.experience_load_key = experience_load_key
+
+if st.session_state.active_experience_digest != experience_digest:
+    st.session_state.single_output = None
+    st.session_state.active_experience_digest = experience_digest
+
+experience_result = st.session_state.experience_load_result
+experience_index = (
+    experience_result.index
+    if experience_result is not None
+    and getattr(experience_result.index, "available", False)
+    else None
+)
+experience_scope = (
+    f"experience:{experience_digest}" if experience_index is not None else ""
+)
+experience_fatal = bool(st.session_state.experience_load_error)
+if st.session_state.experience_load_error:
+    st.error(
+        "经验文件读取失败，本次分析已暂停："
+        f"{st.session_state.experience_load_error}"
+    )
+elif experience_file is not None and experience_result is not None:
+    issues = list(getattr(experience_result, "issues", ()))
+    errors = [
+        issue for issue in issues
+        if str(getattr(issue, "severity", "")).lower() == "error"
+    ]
+    warnings = [issue for issue in issues if issue not in errors]
+    experience_fatal = bool(errors) or experience_index is None
+    if experience_index is not None:
+        st.success(
+            f"经验文件已加载：{len(experience_index.records)} 条有效动作经验，"
+            f"版本 {experience_digest[:10]}。"
+        )
+    if issues:
+        with st.expander(
+            f"经验文件校验信息（错误 {len(errors)}，警告 {len(warnings)}）",
+            expanded=bool(errors),
+        ):
+            for issue in issues:
+                sheet = str(getattr(issue, "sheet", "") or "")
+                row = getattr(issue, "row", None)
+                location = (
+                    f"{sheet}!{row}"
+                    if sheet and row is not None
+                    else sheet
+                )
+                message = str(getattr(issue, "message", issue))
+                prefix = "❌" if issue in errors else "⚠️"
+                st.write(f"{prefix} {location} {message}".strip())
+
 batch_run_signature = (
     uploaded_digest,
     uploaded_file.name if uploaded_file is not None else "",
     llm_run_signature,
     use_common_chart,
     manual_decomposition_review,
+    experience_digest or "",
+    experience_file.name if experience_file is not None else "",
 )
 review_in_progress = (
     st.session_state.batch_flow.get("stage") == "editing"
@@ -340,7 +439,7 @@ batch_submitted = st.button(
         else "🚀 开始批量分析"
     ),
     type="primary",
-    disabled=uploaded_file is None or review_in_progress,
+    disabled=uploaded_file is None or review_in_progress or experience_fatal,
     key="analyze_excel",
 )
 
@@ -366,6 +465,9 @@ if batch_submitted and uploaded_file is not None:
             common_rows=st.session_state.common_rows,
             use_common_chart=use_common_chart,
             llm_pick_value=pick_value,
+            part_weight_index=st.session_state.part_weight_index,
+            experience_index=experience_index,
+            experience_scope=experience_scope,
         )
         with llm_runtime(
             backend=llm_backend_override,
@@ -686,6 +788,9 @@ if (
                     common_rows=st.session_state.common_rows,
                     use_common_chart=use_common_chart,
                     llm_pick_value=pick_value,
+                    part_weight_index=st.session_state.part_weight_index,
+                    experience_index=experience_index,
+                    experience_scope=experience_scope,
                 )
                 with llm_runtime(
                     backend=llm_backend_override,
@@ -831,6 +936,15 @@ if (
             else f"环境配置（{settings.LLM_BACKEND}）"
         )
     )
+    st.caption(
+        "本次 STDS 经验："
+        + (
+            f"{batch_output['experience_filename']} / "
+            f"{batch_output['experience_digest'][:10]}"
+            if batch_output["experience_filename"]
+            else "未使用"
+        )
+    )
 elif (
     uploaded_file is not None
     and batch_output is not None
@@ -883,9 +997,11 @@ with st.form("analysis_form"):
 
 if analyze_submitted and not operation.strip():
     st.warning("请输入操作描述")
+if analyze_submitted and experience_fatal:
+    st.error("请先修复或移除无效的 STDS 评估经验文件。")
 
 # ---------- 分析提交 ----------
-if analyze_submitted and operation.strip():
+if analyze_submitted and operation.strip() and not experience_fatal:
     live_decomposition = st.empty()
     live_progress = st.empty()
     live_details = st.empty()
@@ -947,6 +1063,9 @@ if analyze_submitted and operation.strip():
                 common_rows=common_rows,
                 use_common_chart=use_common_chart,
                 llm_pick_value=pick_value,
+                part_weight_index=st.session_state.part_weight_index,
+                experience_index=experience_index,
+                experience_scope=experience_scope,
             )
             with llm_runtime(
                 backend=llm_backend_override,
@@ -970,6 +1089,10 @@ if analyze_submitted and operation.strip():
             "analysis": single_analysis,
             "use_common_chart": use_common_chart,
             "llm_run_signature": llm_run_signature,
+            "experience_digest": experience_digest or "",
+            "experience_filename": (
+                experience_file.name if experience_file is not None else ""
+            ),
         }
         status_state = "complete" if single_analysis.status == "成功" else "error"
         single_status.update(
@@ -994,6 +1117,7 @@ if single_output is not None:
         "llm_run_signature",
         ("configured", "", ""),
     )
+    single_experience_filename = single_output.get("experience_filename", "")
     st.divider()
     st.subheader("📋 单条分析结果")
 
@@ -1016,6 +1140,11 @@ if single_output is not None:
             f"Ollama / {single_llm_signature[2]}"
             if single_llm_signature[0] == "ollama"
             else f"环境配置（{settings.LLM_BACKEND}）"
+        )
+        + (
+            f"｜经验文件：{single_experience_filename}"
+            if single_experience_filename
+            else "｜经验文件：未使用"
         )
     )
 
@@ -1114,6 +1243,11 @@ if single_output is not None:
                     "cache": st.session_state.cache,
                     "history_index": None,
                     "goldens": [],
+                    "experience_scope": (
+                        f"experience:{single_output['experience_digest']}"
+                        if single_output.get("experience_digest")
+                        else ""
+                    ),
                 })())
                 item.result = edited
                 st.session_state.history.append({

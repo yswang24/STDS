@@ -4,8 +4,15 @@ from __future__ import annotations
 import asyncio
 import json
 
+from stds.cascade.resolver import Deps
+from stds.data.cache import AutoCache
 from stds.domain.models import Source, StdsResult
+from stds.llm.extract_part_name import PartOperationGroup
 from stds.pipeline.operation_analysis import analyze_operation
+from stds.retrieval.part_weight_index import (
+    PartWeightMatch,
+    PartWeightSource,
+)
 
 
 def _result(element, time_s=1.25):
@@ -83,6 +90,69 @@ def test_manual_single_operation_is_decomposed_and_summed():
     assert [row["工位号"] for row in decomposition_rows] == ["手动输入"] * 3
     assert [row["作业描述"] for row in decomposition_rows] == children
     assert [row["翻译后作业描述"] for row in decomposition_rows] == children
+
+
+def test_single_operation_children_share_parent_weight_context():
+    children = ["夹持低压线束", "移动吊具", "落位低压线束"]
+    received = {}
+
+    class WeightIndex:
+        available = True
+
+        async def match(self, query):
+            return PartWeightMatch(
+                query=query,
+                matched_name="低压线束",
+                part_no="P1",
+                weight_kg=0.095,
+                similarity=1.0,
+                match_type="exact",
+                sources=(PartWeightSource("DU", 40, "E40"),),
+            )
+
+    async def groups(parent, operations):
+        return (
+            PartOperationGroup(
+                part_name="低压线束",
+                child_indexes=[1, 2, 3],
+                reason="同一操作链",
+            ),
+        )
+
+    async def decomposer(_):
+        return children
+
+    async def resolver(
+        element,
+        deps,
+        *,
+        machine_hint=None,
+        numeric_context=None,
+        part_context_resolved=False,
+    ):
+        assert part_context_resolved
+        received[element.operation_des] = numeric_context
+        return _result(element)
+
+    deps = Deps(
+        charts={},
+        cache=AutoCache(),
+        part_weight_index=WeightIndex(),
+        llm_extract_part_groups=groups,
+    )
+    analysis = asyncio.run(
+        analyze_operation(
+            "人工A用吊具转运低压线束",
+            deps,
+            resolver=resolver,
+            decomposer=decomposer,
+        )
+    )
+
+    assert analysis.status == "成功"
+    assert set(received) == set(children)
+    assert len({id(context) for context in received.values()}) == 1
+    assert {context.weight_kg for context in received.values()} == {0.095}
 
 
 def test_single_operation_translates_display_only_and_resolves_original_children():

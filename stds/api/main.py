@@ -24,6 +24,7 @@ from stds.data.charts_loader import load_charts
 from stds.llm.client import llm_runtime
 from stds.pipeline.runner import BUS, run_station
 from stds.pipeline.state import RecordStatus, StateManager
+from stds.retrieval.part_weight_index import load_part_weight_index
 from stds.review.apply import apply_edits
 from stds.review.flywheel import on_review_confirmed
 
@@ -33,6 +34,7 @@ api = FastAPI(title="STDS 工时分析系统")
 _state = StateManager()
 _charts = load_charts()
 _cache = AutoCache()
+_part_weight_index = load_part_weight_index()
 
 
 def _get_deps(*, use_common_chart: bool = False) -> Deps:
@@ -40,6 +42,7 @@ def _get_deps(*, use_common_chart: bool = False) -> Deps:
         charts=_charts,
         cache=_cache,
         use_common_chart=use_common_chart,
+        part_weight_index=_part_weight_index,
     )
 
 

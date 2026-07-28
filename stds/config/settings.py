@@ -56,6 +56,16 @@ class Settings:
     CONCURRENCY_LIMIT: int = int(os.environ.get("CONCURRENCY_LIMIT", "8"))
     MAX_TOKENS: int = int(os.environ.get("MAX_TOKENS", "4096"))
     STATE_TTL_DAYS: int = int(os.environ.get("STATE_TTL_DAYS", "7"))
+    PART_WEIGHT_XLSX_PATH: str = os.environ.get(
+        "PART_WEIGHT_XLSX_PATH",
+        "/Users/wangyushan/Desktop/重量信息汇总20260723.xlsx",
+    )
+    PART_WEIGHT_SIMILARITY_THRESHOLD: float = float(
+        os.environ.get("PART_WEIGHT_SIMILARITY_THRESHOLD", "0.85")
+    )
+    PART_WEIGHT_SIMILARITY_MARGIN: float = float(
+        os.environ.get("PART_WEIGHT_SIMILARITY_MARGIN", "0.05")
+    )
 
 
 settings = Settings()

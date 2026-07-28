@@ -9,7 +9,19 @@ def on_review_confirmed(el, result, deps):
     result.edited = True
     unit_time = result.time_s / (result.freq or 1.0)
     cache_template = replace(result, time_s=unit_time, freq=1.0)
-    deps.cache.put(el.norm_key, cache_template)          # 回灌 T0(未来同文本零 LLM)
+    experience_scope = getattr(deps, "experience_scope", "") or ""
+    if experience_scope:
+        try:
+            deps.cache.put(
+                el.norm_key,
+                cache_template,
+                scope=experience_scope,
+            )                                            # 同经验版本内复用
+        except TypeError:
+            # 旧自定义缓存不支持 namespace 时宁可不回灌，也不能跨经验串用。
+            pass
+    else:
+        deps.cache.put(el.norm_key, cache_template)
     if deps.history_index is not None:
         deps.history_index.add(el.operation_des, result) # 回灌 T1(M3 接入后生效)
     if hasattr(deps, "goldens"):

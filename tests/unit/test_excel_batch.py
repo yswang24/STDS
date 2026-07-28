@@ -9,7 +9,10 @@ from io import BytesIO, StringIO
 import pytest
 from openpyxl import Workbook, load_workbook
 
+from stds.cascade.resolver import Deps
+from stds.data.cache import AutoCache
 from stds.domain.models import Source, StdsResult
+from stds.llm.extract_part_name import PartOperationGroup
 from stds.pipeline.excel_batch import (
     DECOMPOSITION_HEADERS,
     INPUT_HEADERS,
@@ -20,6 +23,10 @@ from stds.pipeline.excel_batch import (
     analyze_excel_bytes,
     decompose_excel_bytes,
     review_decomposition_rows,
+)
+from stds.retrieval.part_weight_index import (
+    PartWeightMatch,
+    PartWeightSource,
 )
 
 
@@ -729,6 +736,145 @@ def test_global_sequence_is_rebuilt_and_duplicate_operations_are_analyzed_once()
         "项目乙",
     ]
     assert [final_ws.cell(row, 5).value for row in (2, 3)] == ["OP010", "OP020"]
+
+
+def test_batch_children_from_one_parent_share_one_weight_context():
+    children = [
+        "人工A用吊具夹持主低压线束",
+        "人工A移动吊具",
+        "人工A落位主低压线束",
+    ]
+    received_contexts = {}
+    group_calls = 0
+    match_calls = 0
+
+    class WeightIndex:
+        available = True
+
+        async def match(self, query):
+            nonlocal match_calls
+            match_calls += 1
+            return PartWeightMatch(
+                query=query,
+                matched_name="低压线束",
+                part_no="P1",
+                weight_kg=0.095,
+                similarity=0.96,
+                match_type="semantic",
+                sources=(PartWeightSource("DU", 40, "E40"),),
+            )
+
+    async def extract_groups(parent, operations):
+        nonlocal group_calls
+        group_calls += 1
+        assert parent == "人工A用吊具转运主低压线束"
+        assert tuple(operations) == tuple(children)
+        return (
+            PartOperationGroup(
+                part_name="主低压线束",
+                child_indexes=[1, 2, 3],
+                reason="同一吊运链",
+            ),
+        )
+
+    async def decomposer(_):
+        return children
+
+    async def translator(operation):
+        return operation
+
+    async def resolver(
+        element,
+        deps,
+        *,
+        machine_hint=None,
+        numeric_context=None,
+        part_context_resolved=False,
+    ):
+        assert machine_hint is False
+        assert part_context_resolved is True
+        received_contexts[element.operation_des] = numeric_context
+        return _result(element)
+
+    deps = Deps(
+        charts={},
+        cache=AutoCache(),
+        part_weight_index=WeightIndex(),
+        llm_extract_part_groups=extract_groups,
+    )
+    batch = asyncio.run(
+        analyze_excel_bytes(
+            _workbook_bytes(
+                [
+                    [
+                        1,
+                        "项目A",
+                        "M1",
+                        "L1",
+                        "OP010",
+                        "转运",
+                        "人工A用吊具转运主低压线束",
+                    ]
+                ]
+            ),
+            "一致性.xlsx",
+            deps,
+            resolver=resolver,
+            decomposer=decomposer,
+            translator=translator,
+        )
+    )
+
+    assert batch.detail_count == 3
+    assert group_calls == 1
+    assert match_calls == 1
+    assert set(received_contexts) == set(children)
+    assert len({id(context) for context in received_contexts.values()}) == 1
+    assert {context.weight_kg for context in received_contexts.values()} == {
+        0.095
+    }
+
+
+def test_unchanged_manual_review_preserves_parent_child_boundary():
+    children = ["夹持低压线束", "移动吊具", "落位低压线束"]
+
+    async def decomposer(_):
+        return children
+
+    stage = asyncio.run(
+        decompose_excel_bytes(
+            _workbook_bytes(
+                [
+                    [
+                        1,
+                        "项目A",
+                        "M1",
+                        "L1",
+                        "OP010",
+                        "转运",
+                        "人工A用吊具转运低压线束",
+                    ]
+                ]
+            ),
+            "人工审核.xlsx",
+            object(),
+            decomposer=decomposer,
+        )
+    )
+    reviewed = review_decomposition_rows(
+        stage,
+        stage.decomposition_rows(),
+    )
+
+    assert len(reviewed.rows) == 1
+    assert reviewed.detail_count == 3
+    assert reviewed.rows[0].input_row.operation == "人工A用吊具转运低压线束"
+    assert reviewed.rows[0].split.operations == tuple(children)
+    assert [detail.child_index for detail in reviewed.rows[0].details] == [
+        1,
+        2,
+        3,
+    ]
 
 
 @pytest.mark.parametrize(
