@@ -9,7 +9,8 @@ from io import BytesIO, StringIO
 import pytest
 from openpyxl import Workbook, load_workbook
 
-from stds.cascade.resolver import Deps
+from stds.cascade.numeric import NumericContext
+from stds.cascade.resolver import Deps, PartWeightGroupResolution
 from stds.data.cache import AutoCache
 from stds.domain.models import Source, StdsResult
 from stds.llm.extract_part_name import PartOperationGroup
@@ -736,6 +737,281 @@ def test_global_sequence_is_rebuilt_and_duplicate_operations_are_analyzed_once()
         "项目乙",
     ]
     assert [final_ws.cell(row, 5).value for row in (2, 3)] == ["OP010", "OP020"]
+
+
+def test_parent_repeated_tightening_is_analyzed_once_without_multiplying_rows():
+    children = [
+        "拧紧冷板第一个螺栓",
+        "拧紧冷板第二个螺栓",
+        "拧紧冷板第三个螺栓",
+        "拧紧冷板第四个螺栓",
+    ]
+    resolved_elements = []
+
+    async def decomposer(_):
+        return children
+
+    async def translator(operation):
+        return operation
+
+    async def resolver(element, deps, *, machine_hint=None):
+        assert machine_hint is False
+        resolved_elements.append(element)
+        return _result(element)
+
+    batch = asyncio.run(
+        analyze_excel_bytes(
+            _workbook_bytes(
+                [
+                    [
+                        1,
+                        "项目A",
+                        "M1",
+                        "L1",
+                        "OP010",
+                        "冷板装配",
+                        "操作人员依次拧紧冷板四个螺栓",
+                    ]
+                ]
+            ),
+            "重复拧紧.xlsx",
+            object(),
+            resolver=resolver,
+            decomposer=decomposer,
+            translator=translator,
+        )
+    )
+
+    assert len(resolved_elements) == 1
+    assert resolved_elements[0].operation_des == "拧紧冷板螺栓"
+    assert resolved_elements[0].freq == 1.0
+    assert batch.detail_count == 4
+
+    details = batch.rows[0].details
+    assert [detail.operation for detail in details] == children
+    assert [
+        detail.result.element.operation_des
+        for detail in details
+        if detail.result is not None
+    ] == children
+    assert all(detail.result is not None for detail in details)
+    assert all(detail.result.freq == 1.0 for detail in details)
+    assert all(detail.result.chartcode == "202 010" for detail in details)
+    assert all(detail.result.decision == "T,90,NB" for detail in details)
+    assert all(detail.time_value() == 1.2 for detail in details)
+    assert batch.rows[0].time_value() == 4.8
+    assert len({id(detail.result.trace) for detail in details}) == 4
+
+    output_rows = batch.detail_preview_rows()
+    assert [row["Freq"] for row in output_rows] == [1.0] * 4
+    assert [row["Time(s)"] for row in output_rows] == [1.2] * 4
+    assert sum(row["Time(s)"] for row in output_rows) == 4 * 1.2
+    for row in output_rows:
+        consistency_steps = [
+            step
+            for step in _trace_steps(row["决策链选择的原因"])
+            if step["变量"] == "RepeatedActionConsistency"
+        ]
+        assert consistency_steps == [
+            {
+                "变量": "RepeatedActionConsistency",
+                "选择": "RG1: 拧紧冷板螺栓",
+                "原因": "members=[1, 2, 3, 4]",
+            }
+        ]
+
+
+def test_repeated_actions_are_not_shared_across_parent_rows():
+    children = [
+        "拧紧冷板第一个螺栓",
+        "拧紧冷板第二个螺栓",
+        "拧紧冷板第三个螺栓",
+        "拧紧冷板第四个螺栓",
+    ]
+    resolver_calls = 0
+
+    async def decomposer(_):
+        return children
+
+    async def resolver(element, deps, *, machine_hint=None):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        assert element.operation_des == "拧紧冷板螺栓"
+        return _result(element)
+
+    batch = asyncio.run(
+        analyze_excel_bytes(
+            _workbook_bytes(
+                [
+                    [1, "项目A", "M1", "L1", "OP010", "前工位", "人工拧紧螺栓"],
+                    [2, "项目B", "M2", "L2", "OP020", "后工位", "人工拧紧螺栓"],
+                ]
+            ),
+            "父工序隔离.xlsx",
+            object(),
+            resolver=resolver,
+            decomposer=decomposer,
+        )
+    )
+
+    assert resolver_calls == 2
+    assert batch.total_count == 2
+    assert batch.detail_count == 8
+
+
+def test_repeated_actions_with_different_weight_contexts_are_split(
+    monkeypatch,
+):
+    children = [
+        "拧紧冷板第一个螺栓",
+        "拧紧冷板第二个螺栓",
+        "拧紧冷板第三个螺栓",
+        "拧紧冷板第四个螺栓",
+    ]
+
+    async def decomposer(_):
+        return children
+
+    stage = asyncio.run(
+        decompose_excel_bytes(
+            _workbook_bytes(
+                [
+                    [
+                        1,
+                        "项目A",
+                        "M1",
+                        "L1",
+                        "OP010",
+                        "冷板装配",
+                        "人工依次拧紧冷板四个螺栓",
+                    ]
+                ]
+            ),
+            "重量上下文隔离.xlsx",
+            object(),
+            decomposer=decomposer,
+        )
+    )
+    context_a = NumericContext(0.1, "A", "A", 1.0, "exact")
+    context_b = NumericContext(0.2, "B", "B", 1.0, "exact")
+
+    async def weight_resolutions(rows, deps, sem):
+        assert len(rows) == 1
+        return {
+            id(rows[0]): PartWeightGroupResolution(
+                contexts={
+                    1: context_a,
+                    2: context_a,
+                    3: context_b,
+                    4: context_b,
+                },
+                attempted=True,
+            )
+        }
+
+    monkeypatch.setattr(
+        "stds.pipeline.excel_batch._resolve_parent_weight_groups",
+        weight_resolutions,
+    )
+    received_contexts = []
+
+    async def resolver(
+        element,
+        deps,
+        *,
+        machine_hint=None,
+        numeric_context=None,
+        part_context_resolved=False,
+    ):
+        assert element.operation_des == "拧紧冷板螺栓"
+        assert part_context_resolved is True
+        received_contexts.append(numeric_context)
+        return _result(element)
+
+    batch = asyncio.run(
+        analyze_decomposition_output(
+            stage,
+            object(),
+            resolver=resolver,
+        )
+    )
+
+    assert len(received_contexts) == 2
+    assert {id(context) for context in received_contexts} == {
+        id(context_a),
+        id(context_b),
+    }
+    member_reasons = {
+        step["原因"]
+        for row in batch.detail_preview_rows()
+        for step in _trace_steps(row["决策链选择的原因"])
+        if step["变量"] == "RepeatedActionConsistency"
+    }
+    assert member_reasons == {"members=[1, 2]", "members=[3, 4]"}
+
+
+@pytest.mark.parametrize("failure_mode", ["unresolved", "error"])
+def test_repeated_action_failure_is_shared_with_provenance(failure_mode):
+    children = [
+        "拧紧冷板第一个螺栓",
+        "拧紧冷板第二个螺栓",
+    ]
+    resolver_calls = 0
+
+    async def decomposer(_):
+        return children
+
+    async def translator(operation):
+        return operation
+
+    async def resolver(element, deps, *, machine_hint=None):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        if failure_mode == "unresolved":
+            return StdsResult.unresolved(element, None)
+        raise RuntimeError("shared failure")
+
+    batch = asyncio.run(
+        analyze_excel_bytes(
+            _workbook_bytes(
+                [
+                    [
+                        1,
+                        "项目A",
+                        "M1",
+                        "L1",
+                        "OP010",
+                        "冷板装配",
+                        "人工依次拧紧冷板螺栓",
+                    ]
+                ]
+            ),
+            "重复动作失败.xlsx",
+            object(),
+            resolver=resolver,
+            decomposer=decomposer,
+            translator=translator,
+        )
+    )
+
+    assert resolver_calls == 1
+    details = batch.rows[0].details
+    if failure_mode == "unresolved":
+        assert all(detail.result is not None for detail in details)
+        assert all(detail.result.source == Source.UNRESOLVED for detail in details)
+        assert all(detail.error is None for detail in details)
+        expected_terminal_step = "UNRESOLVED"
+    else:
+        assert all(detail.result is None for detail in details)
+        assert {detail.error for detail in details} == {
+            "RuntimeError: shared failure"
+        }
+        expected_terminal_step = "ERROR"
+
+    for row in batch.detail_preview_rows():
+        trace_steps = _trace_steps(row["决策链选择的原因"])
+        assert trace_steps[0]["变量"] == "RepeatedActionConsistency"
+        assert trace_steps[-1]["变量"] == expected_terminal_step
 
 
 def test_batch_children_from_one_parent_share_one_weight_context():

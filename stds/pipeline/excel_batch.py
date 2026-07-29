@@ -64,9 +64,12 @@ from stds.pipeline.output_schema import (
     TRACE_HEADER,
     TRANSLATED_OPERATION_HEADER,
 )
+from stds.pipeline.repeated_action import (
+    RepeatedActionGroup,
+    build_repeated_action_groups,
+)
 from stds.pipeline.trace_output import (
     EXCEL_CELL_TEXT_LIMIT,
-    decision_reason,
     result_trace_items,
     serialize_trace,
 )
@@ -128,6 +131,7 @@ class ExcelDetailResult:
     display_operation: Optional[str] = None
     result: Optional[StdsResult] = None
     error: Optional[str] = None
+    repeated_action_trace: Optional[tuple[str, str, str]] = None
 
     @property
     def status(self) -> str:
@@ -201,7 +205,7 @@ class ExcelDetailResult:
             cv,
             freq,
             time_value,
-            decision_reason(self.result, self.error),
+            _detail_decision_reason(self),
         ]
 
     @property
@@ -260,7 +264,7 @@ class ExcelRowResult:
             trace.append(("拆解待复核", "回退为原动作", self.split.error))
         for detail in self.details:
             prefix = f"{detail.child_index}/{detail.child_count}"
-            trace.extend(result_trace_items(detail.result, detail.error, prefix=prefix))
+            trace.extend(_detail_result_trace_items(detail, prefix=prefix))
         return serialize_trace(trace)
 
     def time_value(self) -> Optional[float]:
@@ -569,8 +573,33 @@ def _detail_trace(detail: ExcelDetailResult) -> str:
     ]
     if detail.split.error:
         trace.append(("拆解待复核", "回退为原动作", detail.split.error))
-    trace.extend(result_trace_items(detail.result, detail.error))
+    trace.extend(_detail_result_trace_items(detail))
     return serialize_trace(trace)
+
+
+def _detail_result_trace_items(
+    detail: ExcelDetailResult,
+    *,
+    prefix: str = "",
+) -> list:
+    """返回明细分析 trace；resolver 抛错时仍保留重复动作的一致性来源。"""
+    items = result_trace_items(detail.result, detail.error, prefix=prefix)
+    repeated_trace = detail.repeated_action_trace
+    if repeated_trace is None:
+        return items
+    result_has_trace = detail.result is not None and repeated_trace in (
+        detail.result.trace or []
+    )
+    if result_has_trace:
+        return items
+    variable, choice, reason = repeated_trace
+    if prefix:
+        variable = f"{prefix}:{variable}"
+    return [(variable, choice, reason), *items]
+
+
+def _detail_decision_reason(detail: ExcelDetailResult) -> str:
+    return serialize_trace(_detail_result_trace_items(detail))
 
 
 def _result_time(result: StdsResult) -> Optional[float]:
@@ -1300,7 +1329,15 @@ def review_decomposition_rows(
 def _clone_rows_for_analysis(rows: list[ExcelRowResult]) -> list[ExcelRowResult]:
     cloned_rows: list[ExcelRowResult] = []
     for row in rows:
-        details = [replace(detail, result=None, error=None) for detail in row.details]
+        details = [
+            replace(
+                detail,
+                result=None,
+                error=None,
+                repeated_action_trace=None,
+            )
+            for detail in row.details
+        ]
         cloned_rows.append(
             ExcelRowResult(input_row=row.input_row, split=row.split, details=details)
         )
@@ -1394,6 +1431,26 @@ async def _resolve_parent_weight_groups(
     return resolutions
 
 
+@dataclass
+class _DetailAnalysisUnit:
+    details: list[ExcelDetailResult]
+    weight_resolution: PartWeightGroupResolution
+    analysis_operation: str
+    repeated_group: Optional[RepeatedActionGroup] = None
+
+
+def _repeated_action_trace(unit: _DetailAnalysisUnit) -> Optional[tuple[str, str, str]]:
+    repeated_group = unit.repeated_group
+    if repeated_group is None:
+        return None
+    members = [detail.child_index for detail in unit.details]
+    return (
+        "RepeatedActionConsistency",
+        f"{repeated_group.group_id}: {repeated_group.canonical_operation}",
+        f"members={members}",
+    )
+
+
 async def analyze_decomposition_output(
     decomposition: ExcelDecompositionOutput,
     deps: Deps,
@@ -1417,52 +1474,92 @@ async def analyze_decomposition_output(
 
     # 相同动作只有在“父重量解析作用域 + 当前重量上下文”也一致时才复用。
     # 这样既保留原有跨行去重，又不会把不同父工序/不同零件的重量串在一起。
-    grouped_detail_units: dict[
-        tuple,
-        tuple[list[ExcelDetailResult], PartWeightGroupResolution],
-    ] = {}
+    grouped_detail_units: dict[tuple, _DetailAnalysisUnit] = {}
     for row in rows:
         weight_resolution = parent_weight_resolutions[id(row)]
+        repeated_resolution = build_repeated_action_groups(
+            tuple(detail.operation for detail in row.details)
+        )
+        repeated_by_child: dict[int, RepeatedActionGroup] = {}
+        for candidate in repeated_resolution.groups:
+            context_partitions: dict[Optional[int], list[int]] = {}
+            for child_index in candidate.child_indexes:
+                context = weight_resolution.contexts.get(child_index)
+                context_scope = id(context) if context is not None else None
+                context_partitions.setdefault(context_scope, []).append(child_index)
+            for child_indexes in context_partitions.values():
+                if len(child_indexes) > 1:
+                    for child_index in child_indexes:
+                        repeated_by_child[child_index] = candidate
         for detail in row.details:
             numeric_context = weight_resolution.contexts.get(detail.child_index)
-            key = (
-                detail.split.actor,
-                normalize(detail.operation) or detail.operation,
-                (
-                    id(weight_resolution)
-                    if weight_resolution.attempted
-                    else None
-                ),
-                id(numeric_context) if numeric_context is not None else None,
+            weight_scope = (
+                id(weight_resolution)
+                if weight_resolution.attempted
+                else None
             )
+            numeric_scope = (
+                id(numeric_context)
+                if numeric_context is not None
+                else None
+            )
+            repeated_group = repeated_by_child.get(detail.child_index)
+            if repeated_group is None:
+                analysis_operation = detail.operation
+                key = (
+                    "exact",
+                    detail.split.actor,
+                    normalize(detail.operation) or detail.operation,
+                    weight_scope,
+                    numeric_scope,
+                )
+            else:
+                analysis_operation = repeated_group.canonical_operation
+                key = (
+                    "repeated",
+                    id(row),
+                    detail.split.actor,
+                    repeated_group.group_id,
+                    normalize(analysis_operation) or analysis_operation,
+                    weight_scope,
+                    numeric_scope,
+                )
             unit = grouped_detail_units.get(key)
             if unit is None:
-                grouped_detail_units[key] = ([detail], weight_resolution)
+                grouped_detail_units[key] = _DetailAnalysisUnit(
+                    details=[detail],
+                    weight_resolution=weight_resolution,
+                    analysis_operation=analysis_operation,
+                    repeated_group=repeated_group,
+                )
             else:
-                unit[0].append(detail)
+                unit.details.append(detail)
     detail_units = list(grouped_detail_units.values())
 
     analysis_completed = 0
-    total_details = sum(len(group) for group, _ in detail_units)
+    total_details = sum(len(unit.details) for unit in detail_units)
 
-    async def analyze_group(
-        unit: tuple[list[ExcelDetailResult], PartWeightGroupResolution],
-    ) -> None:
+    async def analyze_group(unit: _DetailAnalysisUnit) -> None:
         nonlocal analysis_completed
-        group, weight_resolution = unit
+        group = unit.details
+        weight_resolution = unit.weight_resolution
         representative = group[0]
+        repeated_trace = _repeated_action_trace(unit)
+        if repeated_trace is not None:
+            for detail in group:
+                detail.repeated_action_trace = repeated_trace
         item_started: Optional[float] = None
         try:
             async with sem:
                 item_started = time.perf_counter()
                 element = StdsElement(
                     number=representative.input_row.number,
-                    operation_des=representative.operation,
+                    operation_des=unit.analysis_operation,
                     line_name=str(representative.input_row.line_name or "").strip(),
                     station_op=str(representative.input_row.station_op or "").strip(),
                     freq=1.0,
-                    norm_key=normalize(representative.operation)
-                    or representative.operation,
+                    norm_key=normalize(unit.analysis_operation)
+                    or unit.analysis_operation,
                 )
                 result = await resolve_with_actor(
                     resolver,
@@ -1474,6 +1571,12 @@ async def analyze_decomposition_output(
                     ),
                     part_context_resolved=weight_resolution.attempted,
                 )
+                result_trace = list(result.trace or [])
+                if repeated_trace is not None:
+                    if not result_trace:
+                        result_trace = result_trace_items(result)
+                    result_trace = [repeated_trace, *result_trace]
+                # 一致性组只共享单次决策；成员数绝不写入 freq 或放大单条工时。
                 for detail in group:
                     detail_element = StdsElement(
                         number=detail.input_row.number,
@@ -1483,7 +1586,11 @@ async def analyze_decomposition_output(
                         freq=1.0,
                         norm_key=normalize(detail.operation) or detail.operation,
                     )
-                    detail.result = replace(result, element=detail_element)
+                    detail.result = replace(
+                        result,
+                        element=detail_element,
+                        trace=list(result_trace),
+                    )
         except Exception as exc:
             logger.exception(
                 "Excel decomposed operation failed: operation=%r rows=%s",

@@ -92,6 +92,148 @@ def test_manual_single_operation_is_decomposed_and_summed():
     assert [row["翻译后作业描述"] for row in decomposition_rows] == children
 
 
+def test_repeated_ordinal_children_share_one_canonical_resolution():
+    children = [
+        "操作人员用拧紧枪拧紧电池包第一颗螺栓",
+        "操作人员用拧紧枪拧紧电池包第二颗螺栓",
+        "操作人员用拧紧枪拧紧电池包第三颗螺栓",
+        "操作人员用拧紧枪拧紧电池包第四颗螺栓",
+    ]
+    resolved_elements = []
+    progress_events = []
+
+    async def decomposer(_):
+        return children
+
+    async def resolver(element, deps, *, machine_hint=None):
+        resolved_elements.append(element)
+        return _result(element, time_s=1.25)
+
+    analysis = asyncio.run(
+        analyze_operation(
+            "操作人员使用拧紧枪依次拧紧电池包四颗螺栓",
+            object(),
+            freq=1.0,
+            resolver=resolver,
+            decomposer=decomposer,
+            on_progress=lambda item, completed, total: progress_events.append(
+                (item.index, completed, total)
+            ),
+        )
+    )
+
+    assert len(resolved_elements) == 1
+    canonical_operation = resolved_elements[0].operation_des
+    assert canonical_operation not in children
+    assert all(
+        ordinal not in canonical_operation
+        for ordinal in ("第一", "第二", "第三", "第四")
+    )
+    assert resolved_elements[0].freq == 1.0
+
+    assert [item.operation for item in analysis.items] == children
+    assert len(analysis.items) == 4
+    assert sorted(event[1] for event in progress_events) == [1, 2, 3, 4]
+    results = [item.result for item in analysis.items]
+    assert all(result is not None for result in results)
+    assert [result.element.operation_des for result in results] == children
+    assert {result.freq for result in results} == {1.0}
+    assert {result.element.freq for result in results} == {1.0}
+    assert {result.chartcode for result in results} == {"060 010"}
+    assert {result.decision for result in results} == {"LS,"}
+    assert {result.time_s for result in results} == {1.25}
+    assert len({id(result.trace) for result in results}) == 4
+    assert all(result.trace == results[0].trace for result in results)
+    assert results[0].trace[0][0] == "RepeatedActionConsistency"
+    assert results[0].trace[1] == ("V1", "Laser Scan", "operation-match")
+
+    repeated_steps = [
+        next(
+            step
+            for step in result.trace
+            if step[0] == "RepeatedActionConsistency"
+        )
+        for result in results
+    ]
+    assert all(canonical_operation in step[1] for step in repeated_steps)
+    assert all(step[2] == "members=[1, 2, 3, 4]" for step in repeated_steps)
+    assert len({step[1].split(":", 1)[0] for step in repeated_steps}) == 1
+
+    item_time_sum = sum(result.time_s for result in results)
+    assert item_time_sum == 5.0
+    assert analysis.total_time_s == item_time_sum
+
+
+def test_repeated_ordinal_children_clone_unresolved_result_consistently():
+    children = [
+        "操作人员拧紧第一颗螺栓",
+        "操作人员拧紧第二颗螺栓",
+    ]
+    resolver_calls = 0
+
+    async def resolver(element, deps, *, machine_hint=None):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return StdsResult.unresolved(element, "050 010")
+
+    analysis = asyncio.run(
+        analyze_operation(
+            "操作人员依次拧紧两颗螺栓",
+            object(),
+            resolver=resolver,
+            decomposer=lambda _: asyncio.sleep(0, result=children),
+        )
+    )
+
+    assert resolver_calls == 1
+    assert analysis.status == "待复核"
+    assert analysis.total_time_s is None
+    assert [item.result.element.operation_des for item in analysis.items] == children
+    assert all(item.result.source == Source.UNRESOLVED for item in analysis.items)
+    assert all(
+        any(step[0] == "RepeatedActionConsistency" for step in item.result.trace)
+        for item in analysis.items
+    )
+    assert all(
+        any(step[0] == "UNRESOLVED" for step in item.result.trace)
+        for item in analysis.items
+    )
+    assert len({id(item.result.trace) for item in analysis.items}) == 2
+
+
+def test_repeated_ordinal_children_clone_resolver_error_consistently():
+    children = [
+        "操作人员拧紧第一颗螺栓",
+        "操作人员拧紧第二颗螺栓",
+    ]
+    resolver_calls = 0
+
+    async def resolver(element, deps, *, machine_hint=None):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        raise RuntimeError("shared resolver failure")
+
+    analysis = asyncio.run(
+        analyze_operation(
+            "操作人员依次拧紧两颗螺栓",
+            object(),
+            resolver=resolver,
+            decomposer=lambda _: asyncio.sleep(0, result=children),
+        )
+    )
+
+    assert resolver_calls == 1
+    assert analysis.status == "失败"
+    assert all(item.result is None for item in analysis.items)
+    assert {item.error for item in analysis.items} == {
+        "RuntimeError: shared resolver failure"
+    }
+    for row in analysis.detail_rows():
+        trace_steps = _trace_steps(row["决策链选择的原因"])
+        assert trace_steps[0]["变量"] == "RepeatedActionConsistency"
+        assert trace_steps[-1]["变量"] == "ERROR"
+
+
 def test_single_operation_children_share_parent_weight_context():
     children = ["夹持低压线束", "移动吊具", "落位低压线束"]
     received = {}

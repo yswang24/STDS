@@ -38,7 +38,8 @@ from stds.pipeline.output_schema import (
     TIME_HEADER,
     TRANSLATED_OPERATION_HEADER,
 )
-from stds.pipeline.trace_output import decision_reason
+from stds.pipeline.repeated_action import build_repeated_action_groups
+from stds.pipeline.trace_output import result_trace_items, serialize_trace
 
 logger = logging.getLogger("stds.operation_analysis")
 
@@ -73,6 +74,7 @@ class OperationAnalysisItem:
     error: Optional[str] = None
     elapsed_s: float = 0.0
     split_needs_review: bool = False
+    repeated_action_trace: Optional[tuple[str, str, str]] = None
 
     @property
     def output_operation(self) -> str:
@@ -159,10 +161,90 @@ class OperationAnalysis:
                     CV_HEADER: cv,
                     FREQ_HEADER: freq,
                     TIME_HEADER: time_value,
-                    DECISION_REASON_HEADER: decision_reason(result, item.error),
+                    DECISION_REASON_HEADER: _item_decision_reason(item),
                 }
             )
         return rows
+
+
+def _item_decision_reason(item: OperationAnalysisItem) -> str:
+    trace = result_trace_items(item.result, item.error)
+    repeated_trace = item.repeated_action_trace
+    if repeated_trace is None:
+        return serialize_trace(trace)
+    result_has_trace = (
+        item.result is not None
+        and repeated_trace in (item.result.trace or [])
+    )
+    if not result_has_trace:
+        trace = [repeated_trace, *trace]
+    return serialize_trace(trace)
+
+
+@dataclass(frozen=True)
+class _OperationAnalysisUnit:
+    """一次解析调用及其对应的原始拆解动作。"""
+
+    child_indexes: tuple[int, ...]
+    resolve_operation: str
+    repeated_group_id: Optional[str] = None
+
+
+def _build_analysis_units(
+    operations: Sequence[str],
+    weight_resolution: PartWeightGroupResolution,
+) -> list[_OperationAnalysisUnit]:
+    """按重复动作组生成解析单元，并隔离不同的重量上下文。"""
+    repeated = build_repeated_action_groups(operations)
+    units: list[_OperationAnalysisUnit] = []
+    grouped_indexes: set[int] = set()
+
+    for group in repeated.groups:
+        context_partitions: list[tuple[Optional[NumericContext], list[int]]] = []
+        for child_index in group.child_indexes:
+            context = weight_resolution.contexts.get(child_index)
+            partition = next(
+                (
+                    indexes
+                    for candidate, indexes in context_partitions
+                    if candidate is context
+                ),
+                None,
+            )
+            if partition is None:
+                partition = []
+                context_partitions.append((context, partition))
+            partition.append(child_index)
+            grouped_indexes.add(child_index)
+
+        for _, child_indexes in context_partitions:
+            indexes = tuple(child_indexes)
+            if len(indexes) == 1:
+                child_index = indexes[0]
+                units.append(
+                    _OperationAnalysisUnit(
+                        child_indexes=indexes,
+                        resolve_operation=operations[child_index - 1],
+                    )
+                )
+                continue
+            units.append(
+                _OperationAnalysisUnit(
+                    child_indexes=indexes,
+                    resolve_operation=group.canonical_operation,
+                    repeated_group_id=group.group_id,
+                )
+            )
+
+    for child_index, child in enumerate(operations, start=1):
+        if child_index not in grouped_indexes:
+            units.append(
+                _OperationAnalysisUnit(
+                    child_indexes=(child_index,),
+                    resolve_operation=child,
+                )
+            )
+    return sorted(units, key=lambda unit: unit.child_indexes[0])
 
 
 async def _notify(callback: Optional[Callable], *args) -> None:
@@ -304,53 +386,98 @@ async def analyze_operation(
         for child in split.operations
     )
     split = replace(split, display_operations=display_operations)
+    analysis_units = _build_analysis_units(split.operations, weight_resolution)
     decompose_elapsed_s = time.perf_counter() - decompose_started
     await _notify(on_decomposed, split, decompose_elapsed_s)
 
     completed = 0
     analysis_started = time.perf_counter()
 
-    async def analyze_child(index: int, child: str) -> OperationAnalysisItem:
+    def element_for(operation_des: str) -> StdsElement:
+        return StdsElement(
+            number=number,
+            operation_des=operation_des,
+            line_name=line_name,
+            station_op=station_op,
+            freq=freq,
+            norm_key=normalize(operation_des) or operation_des,
+        )
+
+    async def analyze_unit(
+        unit: _OperationAnalysisUnit,
+    ) -> list[OperationAnalysisItem]:
         nonlocal completed
         item_started = time.perf_counter()
-        item = OperationAnalysisItem(
-            index,
-            len(split.operations),
-            child,
-            display_operation=split.output_operations[index - 1],
-            split_needs_review=split.needs_review,
-        )
-        try:
-            element = StdsElement(
-                number=number,
-                operation_des=child,
-                line_name=line_name,
-                station_op=station_op,
-                freq=freq,
-                norm_key=normalize(child) or child,
+        items = [
+            OperationAnalysisItem(
+                child_index,
+                len(split.operations),
+                split.operations[child_index - 1],
+                display_operation=split.output_operations[child_index - 1],
+                split_needs_review=split.needs_review,
             )
-            item.result = await resolve_with_actor(
+            for child_index in unit.child_indexes
+        ]
+        repeated_trace = (
+            (
+                "RepeatedActionConsistency",
+                f"{unit.repeated_group_id}: {unit.resolve_operation}",
+                f"members={list(unit.child_indexes)}",
+            )
+            if unit.repeated_group_id is not None
+            else None
+        )
+        for item in items:
+            item.repeated_action_trace = repeated_trace
+        try:
+            result = await resolve_with_actor(
                 resolver,
-                element,
+                element_for(unit.resolve_operation),
                 deps,
                 split.actor,
-                numeric_context=weight_resolution.contexts.get(index),
+                numeric_context=weight_resolution.contexts.get(
+                    unit.child_indexes[0]
+                ),
                 part_context_resolved=weight_resolution.attempted,
             )
+            for item in items:
+                base_trace = list(result.trace or result_trace_items(result))
+                child_trace = (
+                    [repeated_trace, *base_trace]
+                    if repeated_trace is not None
+                    else base_trace
+                )
+                # 复制单次结果，不按一致性组成员数改写 freq 或 time_s。
+                item.result = replace(
+                    result,
+                    element=element_for(item.operation),
+                    freq=freq,
+                    trace=child_trace,
+                )
         except Exception as exc:
-            logger.exception("Operation child analysis failed: operation=%r", child)
-            item.error = f"{type(exc).__name__}: {exc}"
+            logger.exception(
+                "Operation analysis unit failed: operation=%r children=%s",
+                unit.resolve_operation,
+                unit.child_indexes,
+            )
+            error = f"{type(exc).__name__}: {exc}"
+            for item in items:
+                item.error = error
         finally:
-            item.elapsed_s = time.perf_counter() - item_started
-            completed += 1
-            await _notify(on_progress, item, completed, len(split.operations))
-        return item
+            elapsed_s = time.perf_counter() - item_started
+            per_item_elapsed_s = elapsed_s / len(items)
+            for item in items:
+                item.elapsed_s = per_item_elapsed_s
+                completed += 1
+                await _notify(on_progress, item, completed, len(split.operations))
+        return items
 
-    items = await asyncio.gather(
-        *(
-            analyze_child(index, child)
-            for index, child in enumerate(split.operations, start=1)
-        )
+    item_groups = await asyncio.gather(
+        *(analyze_unit(unit) for unit in analysis_units)
+    )
+    items = sorted(
+        (item for group in item_groups for item in group),
+        key=lambda item: item.index,
     )
     analysis_elapsed_s = time.perf_counter() - analysis_started
     return OperationAnalysis(
