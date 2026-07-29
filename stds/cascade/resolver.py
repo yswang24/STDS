@@ -335,10 +335,12 @@ async def resolve(
     op = el.operation_des
     logger.info(f"===== 开始分析: '{op}' (freq={el.freq}) =====")
 
-    # Excel 两阶段管线已对父动作判定过主体。设备动作直接返回，避免缓存或
-    # 第二次 LLM 分类改变同一批次的判定；人工动作仍可复用缓存和 kNN。
-    if machine_hint is True:
-        logger.info("  [T2] 沿用拆解阶段判定: 设备")
+    # 明示设备动作必须先于缓存、经验、重量和公式链路返回。即使上游留下了
+    # 错误的 False hint，也不能让设备工序泄漏成人工公式结果。
+    explicit_machine = rules.is_explicit_machine_action(op)
+    if machine_hint is True or explicit_machine:
+        reason = "拆解阶段判定" if machine_hint is True else "明示设备主体/自主动作"
+        logger.info("  [T2] %s: 设备", reason)
         return StdsResult.machine_placeholder(el)
 
     weight_scoped = part_context_resolved or numeric_context is not None

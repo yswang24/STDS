@@ -103,6 +103,35 @@ MAX_REVIEW_XLSX_ENTRIES = 2000
 MAX_REVIEW_ROWS = 100_000
 
 
+def _effective_actor(operation: str, inherited_actor: str) -> str:
+    """明确设备子动作覆盖父工序主体，其余动作继承父级判定。"""
+    try:
+        if rules.is_explicit_machine_action(operation):
+            return "设备"
+    except Exception:
+        logger.debug(
+            "Explicit machine child actor rule failed: operation=%r",
+            operation,
+            exc_info=True,
+        )
+    return inherited_actor
+
+
+def _effective_row_actor(
+    operations: Sequence[str],
+    inherited_actor: str,
+) -> str:
+    actors = {
+        _effective_actor(operation, inherited_actor)
+        for operation in operations
+    }
+    if not actors:
+        return inherited_actor
+    if len(actors) == 1:
+        return next(iter(actors))
+    return "混合"
+
+
 class ExcelInputError(ValueError):
     """上传的工作簿缺少可解析结构。"""
 
@@ -132,6 +161,10 @@ class ExcelDetailResult:
     result: Optional[StdsResult] = None
     error: Optional[str] = None
     repeated_action_trace: Optional[tuple[str, str, str]] = None
+
+    @property
+    def effective_actor(self) -> str:
+        return _effective_actor(self.operation, self.split.actor)
 
     @property
     def status(self) -> str:
@@ -169,6 +202,7 @@ class ExcelDetailResult:
     def as_preview(self) -> dict:
         return {
             **self.output_row(),
+            "主体类型": self.effective_actor,
             TRACE_HEADER: _detail_trace(self),
             "状态": self.status,
         }
@@ -176,7 +210,11 @@ class ExcelDetailResult:
     def analysis_values(self) -> tuple[object, object, object, object, object]:
         """返回五个分析字段；无人工工时分析结果时统一输出 NA。"""
         result = self.result
-        if result is None or result.source in {Source.MACHINE, Source.UNRESOLVED}:
+        if (
+            self.effective_actor == "设备"
+            or result is None
+            or result.source in {Source.MACHINE, Source.UNRESOLVED}
+        ):
             return ("NA", "NA", "NA", "NA", "NA")
         time_value = self.time_value()
         return (
@@ -218,7 +256,11 @@ class ExcelDetailResult:
         return dict(zip(OUTPUT_HEADERS, self.output_values()))
 
     def time_value(self) -> Optional[float]:
-        if self.split.needs_review or self.result is None:
+        if (
+            self.effective_actor == "设备"
+            or self.split.needs_review
+            or self.result is None
+        ):
             return None
         return _result_time(self.result)
 
@@ -228,6 +270,15 @@ class ExcelRowResult:
     input_row: ExcelInputRow
     split: OperationSplit
     details: list[ExcelDetailResult]
+
+    @property
+    def effective_actor(self) -> str:
+        actors = {detail.effective_actor for detail in self.details}
+        if not actors:
+            return self.split.actor
+        if len(actors) == 1:
+            return next(iter(actors))
+        return "混合"
 
     @property
     def status(self) -> str:
@@ -257,7 +308,7 @@ class ExcelRowResult:
             (
                 "拆解",
                 json.dumps(self.split.operations, ensure_ascii=False),
-                f"主体={self.split.actor}; 来源={self.split.source}",
+                f"主体={self.effective_actor}; 来源={self.split.source}",
             )
         ]
         if self.split.error:
@@ -268,7 +319,14 @@ class ExcelRowResult:
         return serialize_trace(trace)
 
     def time_value(self) -> Optional[float]:
-        values = [detail.time_value() for detail in self.details]
+        non_device_details = [
+            detail
+            for detail in self.details
+            if detail.effective_actor != "设备"
+        ]
+        if not non_device_details:
+            return None
+        values = [detail.time_value() for detail in non_device_details]
         if any(value is None for value in values):
             return None
         return round(sum(value for value in values if value is not None), 2)
@@ -278,7 +336,7 @@ class ExcelRowResult:
             "工作表": self.input_row.sheet_name,
             "Excel行": self.input_row.row_index,
             "operation": self.input_row.operation,
-            "主体类型": self.split.actor,
+            "主体类型": self.effective_actor,
             "拆解数量": len(self.details),
             DECISION_HEADER: self.decision_value(),
             TRACE_HEADER: self.trace_value(),
@@ -448,6 +506,7 @@ class ExcelProgress:
             "工作表": self.sheet_name,
             "Excel行": self.row_index,
             OUTPUT_OPERATION_HEADER: self.operation,
+            "主体类型": self.actor,
             "拆解序号": (
                 f"{self.child_index}/{self.child_count}"
                 if self.child_index is not None and self.child_count is not None
@@ -568,7 +627,7 @@ def _detail_trace(detail: ExcelDetailResult) -> str:
         (
             "拆解",
             detail.operation,
-            f"{detail.child_index}/{detail.child_count}; 主体={detail.split.actor}; 来源={detail.split.source}",
+            f"{detail.child_index}/{detail.child_count}; 主体={detail.effective_actor}; 来源={detail.split.source}",
         )
     ]
     if detail.split.error:
@@ -896,7 +955,7 @@ async def decompose_excel_bytes(
                     item_elapsed_s=per_row_elapsed_s,
                     total_elapsed_s=time.perf_counter() - batch_started,
                     generated_operations=split.operations,
-                    actor=split.actor,
+                    actor=_effective_row_actor(split.operations, split.actor),
                     sheet_name=input_row.sheet_name,
                     row_index=input_row.row_index,
                     number=input_row.number,
@@ -1127,6 +1186,8 @@ def _review_actor(
     actor_by_norm_key: Mapping[str, str],
 ) -> str:
     """按动作键复用主体；歧义的新动作留给异步分析阶段完整判定。"""
+    if _effective_actor(operation, "") == "设备":
+        return "设备"
     norm_key = normalize(operation) or operation
     if norm_key in actor_by_norm_key:
         return actor_by_norm_key[norm_key]
@@ -1270,12 +1331,17 @@ def review_decomposition_rows(
             child_rows = reviewed_rows[cursor : cursor + child_count]
             cursor += child_count
             child_details = [row.details[0] for row in child_rows]
-            actors = {detail.split.actor for detail in child_details}
-            actor = (
-                next(iter(actors))
-                if len(actors) == 1
-                else PENDING_REVIEW_ACTOR
-            )
+            actors = {
+                detail.split.actor
+                for detail in child_details
+                if detail.effective_actor != "设备"
+            }
+            if len(actors) == 1:
+                actor = next(iter(actors))
+            elif not actors:
+                actor = "设备"
+            else:
+                actor = PENDING_REVIEW_ACTOR
             shared_split = OperationSplit(
                 actor=actor,
                 operations=tuple(
@@ -1396,19 +1462,27 @@ async def _resolve_parent_weight_groups(
     deps: Deps,
     sem: asyncio.Semaphore,
 ) -> dict[int, PartWeightGroupResolution]:
-    """按父工序签名只解析一次重量组，并共享给该父工序的全部子工序。"""
+    """按父工序签名解析人工子动作重量组；设备子动作不接收重量上下文。"""
     resolutions = {
         id(row): PartWeightGroupResolution()
         for row in rows
     }
     grouped_rows: dict[tuple, list[ExcelRowResult]] = {}
     for row in rows:
-        if row.split.actor != "人工":
+        manual_details = [
+            detail
+            for detail in row.details
+            if detail.effective_actor == "人工"
+        ]
+        if not manual_details:
             continue
         signature = (
             normalize(row.input_row.operation) or row.input_row.operation,
             tuple(
-                normalize(detail.operation) or detail.operation
+                (
+                    detail.effective_actor,
+                    normalize(detail.operation) or detail.operation,
+                )
                 for detail in row.details
             ),
         )
@@ -1416,14 +1490,34 @@ async def _resolve_parent_weight_groups(
 
     async def resolve_group(group: list[ExcelRowResult]) -> None:
         representative = group[0]
+        representative_manual_details = [
+            detail
+            for detail in representative.details
+            if detail.effective_actor == "人工"
+        ]
         async with sem:
             resolution = await resolve_part_weight_groups(
                 representative.input_row.operation,
-                tuple(detail.operation for detail in representative.details),
+                tuple(
+                    detail.operation
+                    for detail in representative_manual_details
+                ),
                 deps,
             )
+        contexts = {
+            detail.child_index: resolution.contexts[manual_index]
+            for manual_index, detail in enumerate(
+                representative_manual_details,
+                start=1,
+            )
+            if manual_index in resolution.contexts
+        }
+        scoped_resolution = PartWeightGroupResolution(
+            contexts=contexts,
+            attempted=resolution.attempted,
+        )
         for row in group:
-            resolutions[id(row)] = resolution
+            resolutions[id(row)] = scoped_resolution
 
     await asyncio.gather(
         *(resolve_group(group) for group in grouped_rows.values())
@@ -1478,7 +1572,12 @@ async def analyze_decomposition_output(
     for row in rows:
         weight_resolution = parent_weight_resolutions[id(row)]
         repeated_resolution = build_repeated_action_groups(
-            tuple(detail.operation for detail in row.details)
+            tuple(
+                detail.operation
+                if detail.effective_actor == "人工"
+                else ""
+                for detail in row.details
+            )
         )
         repeated_by_child: dict[int, RepeatedActionGroup] = {}
         for candidate in repeated_resolution.groups:
@@ -1492,10 +1591,15 @@ async def analyze_decomposition_output(
                     for child_index in child_indexes:
                         repeated_by_child[child_index] = candidate
         for detail in row.details:
-            numeric_context = weight_resolution.contexts.get(detail.child_index)
+            is_manual = detail.effective_actor == "人工"
+            numeric_context = (
+                weight_resolution.contexts.get(detail.child_index)
+                if is_manual
+                else None
+            )
             weight_scope = (
                 id(weight_resolution)
-                if weight_resolution.attempted
+                if is_manual and weight_resolution.attempted
                 else None
             )
             numeric_scope = (
@@ -1508,7 +1612,7 @@ async def analyze_decomposition_output(
                 analysis_operation = detail.operation
                 key = (
                     "exact",
-                    detail.split.actor,
+                    detail.effective_actor,
                     normalize(detail.operation) or detail.operation,
                     weight_scope,
                     numeric_scope,
@@ -1518,7 +1622,7 @@ async def analyze_decomposition_output(
                 key = (
                     "repeated",
                     id(row),
-                    detail.split.actor,
+                    detail.effective_actor,
                     repeated_group.group_id,
                     normalize(analysis_operation) or analysis_operation,
                     weight_scope,
@@ -1544,6 +1648,8 @@ async def analyze_decomposition_output(
         group = unit.details
         weight_resolution = unit.weight_resolution
         representative = group[0]
+        effective_actor = representative.effective_actor
+        is_manual = effective_actor == "人工"
         repeated_trace = _repeated_action_trace(unit)
         if repeated_trace is not None:
             for detail in group:
@@ -1565,12 +1671,24 @@ async def analyze_decomposition_output(
                     resolver,
                     element,
                     deps,
-                    representative.split.actor,
-                    numeric_context=weight_resolution.contexts.get(
-                        representative.child_index
+                    effective_actor,
+                    numeric_context=(
+                        weight_resolution.contexts.get(
+                            representative.child_index
+                        )
+                        if is_manual
+                        else None
                     ),
-                    part_context_resolved=weight_resolution.attempted,
+                    part_context_resolved=(
+                        weight_resolution.attempted
+                        if is_manual
+                        else False
+                    ),
                 )
+                if effective_actor == "设备" and result.source != Source.MACHINE:
+                    # 有效主体是输出硬约束；防止外部 resolver 忽略 hint 后
+                    # 把旧人工结果写入设备子工序。
+                    result = StdsResult.machine_placeholder(element)
                 result_trace = list(result.trace or [])
                 if repeated_trace is not None:
                     if not result_trace:
@@ -1622,7 +1740,7 @@ async def analyze_decomposition_output(
                         + time.perf_counter()
                         - analysis_batch_started
                     ),
-                    actor=detail.split.actor,
+                    actor=detail.effective_actor,
                     sheet_name=detail.input_row.sheet_name,
                     row_index=detail.input_row.row_index,
                     number=detail.input_row.number,

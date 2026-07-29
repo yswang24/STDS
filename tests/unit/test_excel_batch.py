@@ -443,15 +443,15 @@ def test_reviewed_ambiguous_operation_uses_llm_actor_without_redecomposition():
         )
     )
     reviewed_row = dict(stage.decomposition_rows()[0])
-    reviewed_row["作业描述"] = "机械手完成上件"
-    reviewed_row["翻译后作业描述"] = "机械手完成上件"
+    reviewed_row["作业描述"] = "工装执行上件"
+    reviewed_row["翻译后作业描述"] = "工装执行上件"
     reviewed = review_decomposition_rows(stage, [reviewed_row])
 
     class ClassifierDeps:
         async def llm_classify(self, operation):
             nonlocal classifier_calls
             classifier_calls += 1
-            assert operation == "机械手完成上件"
+            assert operation == "工装执行上件"
             return True
 
     async def machine_resolver(element, deps, *, machine_hint=None):
@@ -479,13 +479,13 @@ def test_reviewed_unchanged_operation_reuses_llm_actor_even_if_number_changes():
         async def llm_classify(self, operation):
             nonlocal classifier_calls
             classifier_calls += 1
-            assert operation == "机械手完成上件"
+            assert operation == "工装执行上件"
             return True
 
     stage = asyncio.run(
         decompose_excel_bytes(
             _workbook_bytes(
-                [[1, "项目A", "M1", "L1", "OP010", "自动线", "机械手完成上件"]]
+                [[1, "项目A", "M1", "L1", "OP010", "自动线", "工装执行上件"]]
             ),
             "1.STDS-PF清单.xlsx",
             ClassifierDeps(),
@@ -513,6 +513,59 @@ def test_reviewed_unchanged_operation_reuses_llm_actor_even_if_number_changes():
     assert batch.rows[0].split.actor == "设备"
 
 
+def test_reviewed_unchanged_explicit_machine_child_overrides_stale_parent_actor():
+    decomposer_calls = 0
+
+    async def decomposer(operation):
+        nonlocal decomposer_calls
+        decomposer_calls += 1
+        assert operation == "操作人员启动上盖拧紧程序"
+        return ["设备自动拧紧上盖螺栓"]
+
+    stage = asyncio.run(
+        decompose_excel_bytes(
+            _workbook_bytes(
+                [
+                    [
+                        1,
+                        "项目A",
+                        "M1",
+                        "L1",
+                        "OP010",
+                        "上盖装配",
+                        "操作人员启动上盖拧紧程序",
+                    ]
+                ]
+            ),
+            "显式设备子动作审核.xlsx",
+            object(),
+            decomposer=decomposer,
+        )
+    )
+    assert stage.rows[0].split.actor == "人工"
+
+    reviewed = review_decomposition_rows(stage, stage.decomposition_rows())
+
+    assert decomposer_calls == 1
+    assert reviewed.rows[0].split.actor == "设备"
+    assert reviewed.rows[0].details[0].effective_actor == "设备"
+
+    async def machine_resolver(element, deps, *, machine_hint=None):
+        assert machine_hint is True
+        return StdsResult.machine_placeholder(element)
+
+    batch = asyncio.run(
+        analyze_decomposition_output(
+            reviewed,
+            object(),
+            resolver=machine_resolver,
+        )
+    )
+
+    assert batch.rows[0].split.actor == "设备"
+    assert list(batch.detail_preview_rows()[0].values())[9:14] == ["NA"] * 5
+
+
 def test_reviewed_actor_classification_failure_is_marked_for_review():
     stage = asyncio.run(
         decompose_excel_bytes(
@@ -523,8 +576,8 @@ def test_reviewed_actor_classification_failure_is_marked_for_review():
         )
     )
     reviewed_row = dict(stage.decomposition_rows()[0])
-    reviewed_row["作业描述"] = "机械手完成上件"
-    reviewed_row["翻译后作业描述"] = "机械手完成上件"
+    reviewed_row["作业描述"] = "工装执行上件"
+    reviewed_row["翻译后作业描述"] = "工装执行上件"
     reviewed = review_decomposition_rows(stage, [reviewed_row])
 
     class BrokenClassifierDeps:
@@ -556,7 +609,7 @@ def test_review_reclassifies_an_untrusted_initial_actor_after_recovery():
     stage = asyncio.run(
         decompose_excel_bytes(
             _workbook_bytes(
-                [[1, "项目A", "M1", "L1", "OP010", "自动线", "机械手完成上件"]]
+                [[1, "项目A", "M1", "L1", "OP010", "自动线", "工装执行上件"]]
             ),
             "1.STDS-PF清单.xlsx",
             BrokenClassifierDeps(),
@@ -1440,6 +1493,241 @@ def test_machine_operation_is_not_decomposed_and_outputs_na_analysis_fields():
         "选择": "设备动作",
         "原因": "判定为设备动作，跳过人工标准时间计算",
     } in _trace_steps(final_ws.cell(2, 15).value)
+
+
+def test_counted_robot_tightening_parent_is_not_decomposed_and_outputs_na():
+    decomposer_calls = 0
+    resolver_hints = []
+
+    async def should_not_decompose(operation):
+        nonlocal decomposer_calls
+        decomposer_calls += 1
+        return [operation]
+
+    async def machine_resolver(element, deps, *, machine_hint=None):
+        resolver_hints.append(machine_hint)
+        return StdsResult.machine_placeholder(element)
+
+    operation = "2个机器人拧紧65颗上盖螺栓，6±1Nm"
+    batch = asyncio.run(
+        analyze_excel_bytes(
+            _workbook_bytes(
+                [[1, "项目A", "M1", "L1", "OP010", "自动线", operation]]
+            ),
+            "机器人拧紧.xlsx",
+            object(),
+            resolver=machine_resolver,
+            decomposer=should_not_decompose,
+        )
+    )
+
+    assert decomposer_calls == 0
+    assert resolver_hints == [True]
+    assert batch.detail_count == 1
+    assert batch.rows[0].details[0].operation == operation
+    final_ws = _sheet(batch.output_bytes)
+    assert [final_ws.cell(2, col).value for col in range(10, 15)] == ["NA"] * 5
+
+
+def test_artificial_parent_explicit_machine_children_use_device_analysis(
+    monkeypatch,
+):
+    children = [
+        "设备自动拧紧上盖螺栓1",
+        "设备自动拧紧上盖螺栓2",
+    ]
+    resolver_calls = []
+    progress = []
+
+    async def decomposer(operation):
+        assert operation == "操作人员启动上盖自动拧紧程序"
+        return children
+
+    async def translator(operation):
+        return operation
+
+    context = NumericContext(0.2, "上盖", "上盖", 1.0, "exact")
+
+    async def weight_resolutions(rows, deps, sem):
+        assert rows[0].split.actor == "人工"
+        return {
+            id(rows[0]): PartWeightGroupResolution(
+                contexts={1: context, 2: context},
+                attempted=True,
+            )
+        }
+
+    monkeypatch.setattr(
+        "stds.pipeline.excel_batch._resolve_parent_weight_groups",
+        weight_resolutions,
+    )
+
+    async def machine_resolver(
+        element,
+        deps,
+        *,
+        machine_hint=None,
+        numeric_context=None,
+        part_context_resolved=False,
+    ):
+        resolver_calls.append(
+            (
+                element.operation_des,
+                machine_hint,
+                numeric_context,
+                part_context_resolved,
+            )
+        )
+        # 模拟忽略 machine_hint 的外部 resolver，批量边界仍须强制设备占位。
+        return _result(element)
+
+    batch = asyncio.run(
+        analyze_excel_bytes(
+            _workbook_bytes(
+                [
+                    [
+                        1,
+                        "项目A",
+                        "M1",
+                        "L1",
+                        "OP010",
+                        "上盖装配",
+                        "操作人员启动上盖自动拧紧程序",
+                    ]
+                ]
+            ),
+            "设备子动作.xlsx",
+            object(),
+            resolver=machine_resolver,
+            decomposer=decomposer,
+            translator=translator,
+            on_progress=progress.append,
+        )
+    )
+
+    assert batch.rows[0].split.actor == "人工"
+    assert [detail.effective_actor for detail in batch.rows[0].details] == [
+        "设备",
+        "设备",
+    ]
+    assert resolver_calls == [
+        (children[0], True, None, False),
+        (children[1], True, None, False),
+    ]
+    assert all(
+        detail.result.source == Source.MACHINE
+        for detail in batch.rows[0].details
+    )
+    assert all(
+        list(row.values())[9:14] == ["NA"] * 5
+        for row in batch.detail_preview_rows()
+    )
+    assert [item.actor for item in progress if item.phase == "工时分析"] == [
+        "设备",
+        "设备",
+    ]
+    assert "主体=设备" in batch.rows[0].trace_value()
+
+
+def test_explicit_machine_children_do_not_form_repeated_action_groups():
+    children = [
+        "设备自动拧紧上盖第1个螺栓",
+        "设备自动拧紧上盖第2个螺栓",
+    ]
+    resolved_operations = []
+
+    async def decomposer(_):
+        return children
+
+    async def translator(operation):
+        return operation
+
+    async def machine_resolver(element, deps, *, machine_hint=None):
+        assert machine_hint is True
+        resolved_operations.append(element.operation_des)
+        return StdsResult.machine_placeholder(element)
+
+    batch = asyncio.run(
+        analyze_excel_bytes(
+            _workbook_bytes(
+                [
+                    [
+                        1,
+                        "项目A",
+                        "M1",
+                        "L1",
+                        "OP010",
+                        "上盖装配",
+                        "操作人员启动上盖拧紧程序",
+                    ]
+                ]
+            ),
+            "设备重复子动作.xlsx",
+            object(),
+            resolver=machine_resolver,
+            decomposer=decomposer,
+            translator=translator,
+        )
+    )
+
+    assert resolved_operations == children
+    assert all(
+        detail.repeated_action_trace is None
+        for detail in batch.rows[0].details
+    )
+    assert all(
+        all(
+            step["变量"] != "RepeatedActionConsistency"
+            for step in _trace_steps(row["决策链选择的原因"])
+        )
+        for row in batch.detail_preview_rows()
+    )
+
+
+def test_mixed_parent_summary_time_ignores_device_na_details():
+    children = [
+        "操作人员拿取上盖",
+        "设备自动拧紧上盖螺栓",
+    ]
+
+    async def decomposer(_):
+        return children
+
+    async def translator(operation):
+        return operation
+
+    async def resolver(element, deps, *, machine_hint=None):
+        if machine_hint:
+            return StdsResult.machine_placeholder(element)
+        return _result(element)
+
+    batch = asyncio.run(
+        analyze_excel_bytes(
+            _workbook_bytes(
+                [
+                    [
+                        1,
+                        "项目A",
+                        "M1",
+                        "L1",
+                        "OP010",
+                        "人机协同",
+                        "操作人员完成人机协同作业",
+                    ]
+                ]
+            ),
+            "混合主体汇总.xlsx",
+            object(),
+            resolver=resolver,
+            decomposer=decomposer,
+            translator=translator,
+        )
+    )
+
+    assert batch.rows[0].effective_actor == "混合"
+    assert batch.rows[0].time_value() == 1.2
+    assert batch.rows[0].as_preview()["Time(s)"] == 1.2
+    assert batch.rows[0].details[1].analysis_values() == ("NA",) * 5
 
 
 def test_work_description_column_g_is_the_only_analysis_source():

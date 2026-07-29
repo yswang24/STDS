@@ -75,6 +75,7 @@ class OperationAnalysisItem:
     elapsed_s: float = 0.0
     split_needs_review: bool = False
     repeated_action_trace: Optional[tuple[str, str, str]] = None
+    actor: str = "人工"
 
     @property
     def output_operation(self) -> str:
@@ -120,7 +121,11 @@ class OperationAnalysis:
         if self.status != "成功":
             return None
         return round(
-            sum(item.result.time_s for item in self.items if item.result is not None),
+            sum(
+                item.result.time_s
+                for item in self.items
+                if item.actor != "设备" and item.result is not None
+            ),
             2,
         )
 
@@ -142,7 +147,11 @@ class OperationAnalysis:
         rows = []
         for item in self.items:
             result = item.result
-            if result is None or result.source in {Source.MACHINE, Source.UNRESOLVED}:
+            if (
+                item.actor == "设备"
+                or result is None
+                or result.source in {Source.MACHINE, Source.UNRESOLVED}
+            ):
                 decision, chartcode, cv, freq, time_value = ("NA",) * 5
             else:
                 decision = result.decision or "NA"
@@ -187,21 +196,34 @@ class _OperationAnalysisUnit:
 
     child_indexes: tuple[int, ...]
     resolve_operation: str
+    actor: str
     repeated_group_id: Optional[str] = None
 
 
 def _build_analysis_units(
     operations: Sequence[str],
+    actors: Sequence[str],
     weight_resolution: PartWeightGroupResolution,
 ) -> list[_OperationAnalysisUnit]:
-    """按重复动作组生成解析单元，并隔离不同的重量上下文。"""
+    """按重复人工动作组生成解析单元，并隔离设备及不同重量上下文。"""
+    if len(operations) != len(actors):
+        raise ValueError("operations 与 actors 数量必须一致")
+
     repeated = build_repeated_action_groups(operations)
     units: list[_OperationAnalysisUnit] = []
     grouped_indexes: set[int] = set()
 
     for group in repeated.groups:
+        human_indexes = tuple(
+            child_index
+            for child_index in group.child_indexes
+            if actors[child_index - 1] != "设备"
+        )
+        if len(human_indexes) < 2:
+            continue
+
         context_partitions: list[tuple[Optional[NumericContext], list[int]]] = []
-        for child_index in group.child_indexes:
+        for child_index in human_indexes:
             context = weight_resolution.contexts.get(child_index)
             partition = next(
                 (
@@ -225,6 +247,7 @@ def _build_analysis_units(
                     _OperationAnalysisUnit(
                         child_indexes=indexes,
                         resolve_operation=operations[child_index - 1],
+                        actor=actors[child_index - 1],
                     )
                 )
                 continue
@@ -232,6 +255,7 @@ def _build_analysis_units(
                 _OperationAnalysisUnit(
                     child_indexes=indexes,
                     resolve_operation=group.canonical_operation,
+                    actor=actors[indexes[0] - 1],
                     repeated_group_id=group.group_id,
                 )
             )
@@ -242,6 +266,7 @@ def _build_analysis_units(
                 _OperationAnalysisUnit(
                     child_indexes=(child_index,),
                     resolve_operation=child,
+                    actor=actors[child_index - 1],
                 )
             )
     return sorted(units, key=lambda unit: unit.child_indexes[0])
@@ -364,15 +389,39 @@ async def analyze_operation(
     started = time.perf_counter()
     decompose_started = time.perf_counter()
     split = await split_operation(operation, deps, decomposer=decomposer)
-    weight_resolution = (
-        await resolve_part_weight_groups(
+    child_actors = tuple(
+        "设备"
+        if rules.is_explicit_machine_action(child)
+        else split.actor
+        for child in split.operations
+    )
+    human_children = tuple(
+        (child_index, child)
+        for child_index, (child, actor) in enumerate(
+            zip(split.operations, child_actors),
+            start=1,
+        )
+        if actor == "人工"
+    )
+    if human_children:
+        human_weight_resolution = await resolve_part_weight_groups(
             operation,
-            split.operations,
+            tuple(child for _, child in human_children),
             deps,
         )
-        if split.actor == "人工"
-        else PartWeightGroupResolution()
-    )
+        weight_resolution = PartWeightGroupResolution(
+            contexts={
+                original_index: human_weight_resolution.contexts[human_index]
+                for human_index, (original_index, _) in enumerate(
+                    human_children,
+                    start=1,
+                )
+                if human_index in human_weight_resolution.contexts
+            },
+            attempted=human_weight_resolution.attempted,
+        )
+    else:
+        weight_resolution = PartWeightGroupResolution()
     unique_operations = tuple(dict.fromkeys(split.operations))
     translated_operations = await asyncio.gather(
         *(
@@ -386,7 +435,11 @@ async def analyze_operation(
         for child in split.operations
     )
     split = replace(split, display_operations=display_operations)
-    analysis_units = _build_analysis_units(split.operations, weight_resolution)
+    analysis_units = _build_analysis_units(
+        split.operations,
+        child_actors,
+        weight_resolution,
+    )
     decompose_elapsed_s = time.perf_counter() - decompose_started
     await _notify(on_decomposed, split, decompose_elapsed_s)
 
@@ -413,6 +466,7 @@ async def analyze_operation(
                 child_index,
                 len(split.operations),
                 split.operations[child_index - 1],
+                actor=unit.actor,
                 display_operation=split.output_operations[child_index - 1],
                 split_needs_review=split.needs_review,
             )
@@ -434,12 +488,22 @@ async def analyze_operation(
                 resolver,
                 element_for(unit.resolve_operation),
                 deps,
-                split.actor,
-                numeric_context=weight_resolution.contexts.get(
-                    unit.child_indexes[0]
+                unit.actor,
+                numeric_context=(
+                    None
+                    if unit.actor == "设备"
+                    else weight_resolution.contexts.get(unit.child_indexes[0])
                 ),
-                part_context_resolved=weight_resolution.attempted,
+                part_context_resolved=(
+                    unit.actor != "设备" and weight_resolution.attempted
+                ),
             )
+            if unit.actor == "设备" and result.source != Source.MACHINE:
+                # 有效主体是最终输出约束。即使外部注入的 resolver 忽略
+                # machine_hint 或返回了旧人工结果，也不能泄漏人工工时。
+                result = StdsResult.machine_placeholder(
+                    element_for(unit.resolve_operation)
+                )
             for item in items:
                 base_trace = list(result.trace or result_trace_items(result))
                 child_trace = (

@@ -164,6 +164,110 @@ def test_repeated_ordinal_children_share_one_canonical_resolution():
     assert analysis.total_time_s == item_time_sum
 
 
+def test_explicit_machine_children_stay_raw_singletons_in_mixed_split():
+    children = [
+        "设备自动拧紧上盖第1个螺栓",
+        "操作人员拿取上盖",
+        "设备自动拧紧上盖第2个螺栓",
+    ]
+    resolver_calls = {}
+
+    class WeightIndex:
+        available = True
+
+        async def match(self, query):
+            return PartWeightMatch(
+                query=query,
+                matched_name="上盖",
+                part_no="P1",
+                weight_kg=0.5,
+                similarity=1.0,
+                match_type="exact",
+                sources=(PartWeightSource("DU", 40, "E40"),),
+            )
+
+    async def groups(parent, operations):
+        assert tuple(operations) == (children[1],)
+        return (
+            PartOperationGroup(
+                part_name="上盖",
+                child_indexes=[1],
+                reason="同一操作链",
+            ),
+        )
+
+    async def resolver(
+        element,
+        deps,
+        *,
+        machine_hint=None,
+        numeric_context=None,
+        part_context_resolved=False,
+    ):
+        resolver_calls[element.operation_des] = (
+            machine_hint,
+            numeric_context,
+            part_context_resolved,
+        )
+        # 模拟一个忽略 machine_hint、错误返回人工公式结果的外部 resolver；
+        # 有效主体仍必须在输出边界强制设备占位。
+        return _result(element)
+
+    deps = Deps(
+        charts={},
+        cache=AutoCache(),
+        part_weight_index=WeightIndex(),
+        llm_extract_part_groups=groups,
+    )
+    analysis = asyncio.run(
+        analyze_operation(
+            "操作人员完成上盖混合作业",
+            deps,
+            resolver=resolver,
+            decomposer=lambda _: asyncio.sleep(0, result=children),
+        )
+    )
+
+    assert analysis.split.actor == "人工"
+    assert [item.operation for item in analysis.items] == children
+    assert set(resolver_calls) == set(children)
+    assert resolver_calls[children[1]][0] is False
+    assert resolver_calls[children[1]][1] is not None
+    assert resolver_calls[children[1]][2] is True
+    for child in (children[0], children[2]):
+        assert resolver_calls[child] == (True, None, False)
+
+    assert analysis.items[1].result.source == Source.FORMULA
+    assert analysis.items[0].result.source == Source.MACHINE
+    assert analysis.items[2].result.source == Source.MACHINE
+    assert all(
+        item.result.element.operation_des == item.operation
+        for item in analysis.items
+    )
+    assert all(
+        not any(
+            step[0] == "RepeatedActionConsistency"
+            for step in item.result.trace
+        )
+        for item in (analysis.items[0], analysis.items[2])
+    )
+
+    detail_rows = analysis.detail_rows()
+    assert detail_rows[1]["Decisions"] == "LS,"
+    for row, child in (
+        (detail_rows[0], children[0]),
+        (detail_rows[2], children[2]),
+    ):
+        assert row["STDS描述"] == child
+        assert [row[key] for key in (
+            "Decisions",
+            "Chart",
+            "增值|非增值",
+            "Freq",
+            "Time(s)",
+        )] == ["NA"] * 5
+
+
 def test_repeated_ordinal_children_clone_unresolved_result_consistently():
     children = [
         "操作人员拧紧第一颗螺栓",
@@ -451,6 +555,56 @@ def test_machine_single_operation_is_not_decomposed():
     assert analysis.split.actor == "设备"
     assert len(analysis.items) == 1
     assert analysis.total_time_s == 0.0
+
+
+def test_explicit_robot_parent_is_not_decomposed():
+    operation = "2个机器人拧紧65颗上盖螺栓，6±1Nm"
+    decomposer_calls = 0
+    weight_group_calls = 0
+    hints = []
+
+    class WeightIndex:
+        available = True
+
+        async def match(self, query):
+            raise AssertionError("设备动作不应查询零件重量")
+
+    async def decomposer(_):
+        nonlocal decomposer_calls
+        decomposer_calls += 1
+        return ["不应拆解"]
+
+    async def groups(parent, operations):
+        nonlocal weight_group_calls
+        weight_group_calls += 1
+        return ()
+
+    async def resolver(element, deps, *, machine_hint=None):
+        hints.append(machine_hint)
+        return StdsResult.machine_placeholder(element)
+
+    deps = Deps(
+        charts={},
+        cache=AutoCache(),
+        part_weight_index=WeightIndex(),
+        llm_extract_part_groups=groups,
+    )
+    analysis = asyncio.run(
+        analyze_operation(
+            operation,
+            deps,
+            resolver=resolver,
+            decomposer=decomposer,
+        )
+    )
+
+    assert decomposer_calls == 0
+    assert weight_group_calls == 0
+    assert analysis.split.actor == "设备"
+    assert analysis.split.operations == (operation,)
+    assert [item.operation for item in analysis.items] == [operation]
+    assert hints == [True]
+    assert analysis.items[0].result.source == Source.MACHINE
 
 
 def test_decomposition_failure_falls_back_and_requires_review():
