@@ -9,7 +9,7 @@ from dataclasses import dataclass, replace
 from typing import Awaitable, Callable, Optional, Sequence
 
 from stds.cascade import rules
-from stds.cascade.numeric import NumericContext
+from stds.cascade.numeric import NumericContext, PartIdentityContext
 from stds.cascade.resolver import (
     Deps,
     PartWeightGroupResolution,
@@ -222,24 +222,39 @@ def _build_analysis_units(
         if len(human_indexes) < 2:
             continue
 
-        context_partitions: list[tuple[Optional[NumericContext], list[int]]] = []
+        context_partitions: list[
+            tuple[
+                Optional[NumericContext],
+                Optional[PartIdentityContext],
+                list[int],
+            ]
+        ] = []
         for child_index in human_indexes:
             context = weight_resolution.contexts.get(child_index)
+            identity_context = weight_resolution.identity_contexts.get(
+                child_index
+            )
             partition = next(
                 (
                     indexes
-                    for candidate, indexes in context_partitions
-                    if candidate is context
+                    for candidate, candidate_identity, indexes
+                    in context_partitions
+                    if (
+                        candidate is context
+                        and candidate_identity is identity_context
+                    )
                 ),
                 None,
             )
             if partition is None:
                 partition = []
-                context_partitions.append((context, partition))
+                context_partitions.append(
+                    (context, identity_context, partition)
+                )
             partition.append(child_index)
             grouped_indexes.add(child_index)
 
-        for _, child_indexes in context_partitions:
+        for _, _, child_indexes in context_partitions:
             indexes = tuple(child_indexes)
             if len(indexes) == 1:
                 child_index = indexes[0]
@@ -348,6 +363,7 @@ async def resolve_with_actor(
     actor: str,
     *,
     numeric_context: Optional[NumericContext] = None,
+    part_identity_context: Optional[PartIdentityContext] = None,
     part_context_resolved: bool = False,
 ) -> StdsResult:
     """按解析器签名传递可用上下文，同时兼容旧的二参数测试解析器。"""
@@ -366,6 +382,8 @@ async def resolve_with_actor(
         kwargs["machine_hint"] = actor == "设备"
     if accepts_kwargs or "numeric_context" in parameters:
         kwargs["numeric_context"] = numeric_context
+    if accepts_kwargs or "part_identity_context" in parameters:
+        kwargs["part_identity_context"] = part_identity_context
     if accepts_kwargs or "part_context_resolved" in parameters:
         kwargs["part_context_resolved"] = part_context_resolved
     return await resolver(element, deps, **kwargs)
@@ -417,6 +435,17 @@ async def analyze_operation(
                     start=1,
                 )
                 if human_index in human_weight_resolution.contexts
+            },
+            identity_contexts={
+                original_index: human_weight_resolution.identity_contexts[
+                    human_index
+                ]
+                for human_index, (original_index, _) in enumerate(
+                    human_children,
+                    start=1,
+                )
+                if human_index
+                in human_weight_resolution.identity_contexts
             },
             attempted=human_weight_resolution.attempted,
         )
@@ -493,6 +522,13 @@ async def analyze_operation(
                     None
                     if unit.actor == "设备"
                     else weight_resolution.contexts.get(unit.child_indexes[0])
+                ),
+                part_identity_context=(
+                    None
+                    if unit.actor == "设备"
+                    else weight_resolution.identity_contexts.get(
+                        unit.child_indexes[0]
+                    )
                 ),
                 part_context_resolved=(
                     unit.actor != "设备" and weight_resolution.attempted

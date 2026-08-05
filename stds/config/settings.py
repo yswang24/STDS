@@ -23,9 +23,9 @@ _load_env()
 @dataclass
 class Settings:
     DB_PATH: str = os.environ.get(
-        "DB_PATH", "/Users/wangyushan/Desktop/STMS-STDS20260610/stms.db"
+        "DB_PATH", str(Path(__file__).resolve().parents[2] / "stms.db")
     )
-    # LLM 后端:auto / vllm / custom / ollama / mock
+    # LLM 后端:auto / vllm / deepseek / custom / ollama / mock
     LLM_BACKEND: str = os.environ.get("LLM_BACKEND", "auto")
     # vLLM(OpenAI 兼容)
     VLLM_BASE_URL: str = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
@@ -35,6 +35,18 @@ class Settings:
     # 若有独立 embedding 服务(如 8001)则填其 /v1 地址
     VLLM_EMBED_BASE_URL: str = os.environ.get("VLLM_EMBED_BASE_URL", "")
     VLLM_EMBED_MODEL: str = os.environ.get("VLLM_EMBED_MODEL", "qwen3-embedding")
+    # Embedding 与聊天后端解耦；DeepSeek 聊天可同时使用 vLLM/Ollama 向量。
+    EMBED_BACKEND: str = os.environ.get("EMBED_BACKEND", "auto")
+    # DeepSeek 官方 OpenAI 兼容 API（仅聊天；官方当前不提供 embedding 端点）
+    DEEPSEEK_API_BASE_URL: str = os.environ.get(
+        "DEEPSEEK_API_BASE_URL",
+        os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+    )
+    DEEPSEEK_API_KEY: str = os.environ.get("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_LLM_MODEL: str = os.environ.get(
+        "DEEPSEEK_LLM_MODEL",
+        "deepseek-v4-flash",
+    )
     # 自定义 API(任意 OpenAI 兼容端点,如 DeepSeek / 智谱 / 自部署)
     CUSTOM_API_BASE_URL: str = os.environ.get("CUSTOM_API_BASE_URL", "http://localhost:9000/v1")
     CUSTOM_API_KEY: str = os.environ.get("CUSTOM_API_KEY", "")

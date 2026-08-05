@@ -21,7 +21,7 @@ def test_traverse_020_02a():
 
 
 def test_traverse_all_charts_finish():
-    """62 个 chartcode 全部用'选第0个'能终止(不抛错、不无限循环)。"""
+    """64 个 chartcode 全部用'选第0个'能终止(不抛错、不无限循环)。"""
     charts = load_charts()
     async def pick(op, cands):
         return cands[0], 1.0, "t"

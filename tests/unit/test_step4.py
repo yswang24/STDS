@@ -2,7 +2,13 @@
 from __future__ import annotations
 
 from stds.data.charts_loader import load_charts
-from stds.engine.decision_codec import decode, encode
+from stds.engine.decision_codec import (
+    canonicalize_decision,
+    decode,
+    decode_strict_with_trace,
+    encode,
+)
+from stds.engine.formula import evaluate
 
 
 def test_decode_202_010():
@@ -42,3 +48,20 @@ def test_encode_keeps_one_trailing_comma_only_for_empty_last_decision():
     assert encode(["LS,", ""]) == "LS,"
     assert encode(["LS,", "", ""]) == "LS,"
     assert encode(["PSF,", "", "E,"]) == "PSF,,E"
+
+
+def test_all_candidates_abbrev_exact_precedes_numeric_fallback():
+    charts = load_charts()
+    values, trace = decode_strict_with_trace(
+        charts["050 222"],
+        "UOBS,3.0MX",
+    )
+    assert values[2] == 4.0
+    assert evaluate(charts["050 222"], values) == 2.04
+    assert any("match=abbrev-exact" in step[2] for step in trace)
+
+
+def test_legacy_nar_token_is_canonicalized_to_narx():
+    assert canonicalize_decision("SIM,18IN,0.5LBS,18IN,NAR,") == (
+        "SIM,18IN,0.5LBS,18IN,NARX,"
+    )

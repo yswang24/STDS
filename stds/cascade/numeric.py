@@ -24,6 +24,11 @@ _WEIGHT_ABBREV_PATTERN = re.compile(
     r"KGS?X?(?![A-Z])",
     re.I,
 )
+_WEIGHT_LBS_PATTERN = re.compile(
+    r"(?<![\d.])((?:\d+(?:\.\d+)?)|(?:\.\d+))\s*"
+    r"(?:lbs?|磅)(?![a-z])",
+    re.I,
+)
 _DISTANCE_PATTERN = re.compile(
     r"(?<![\d.])(\d+(?:\.\d+)?)\s*"
     r"(cm|厘米|m|米|in|英寸|ft|英尺)(?![a-z])",
@@ -48,13 +53,36 @@ class NumericContext:
     group_id: str = ""
 
 
+@dataclass(frozen=True)
+class PartIdentityContext:
+    """已识别的物理零件身份；不要求重量表已经提供单重。"""
+
+    part_name: str
+    identity_key: str
+    source: str = ""
+    group_id: str = ""
+
+
 def parse_numeric(text: str):
     """返回 (kind, value) 或 None。"""
+    values = parse_numerics(text)
+    return values[0] if values else None
+
+
+def parse_numerics(text: str) -> list[tuple[str, float]]:
+    """返回描述中的全部工程数值，保持既有维度优先顺序。
+
+    一个动作可能同时出现移动距离、物体重量和转速。选值节点应逐一尝试，
+    直到找到与当前候选维度相符的事实，而不能因首个事实属于其他维度就
+    错误回退到 LLM。
+    """
+    values: list[tuple[str, float]] = []
     for pat, kind in _PATTERNS:
-        m = pat.search(text)
-        if m:
-            return (kind, float(m.group(1)))
-    return None
+        values.extend(
+            (kind, float(match.group(1)))
+            for match in pat.finditer(text)
+        )
+    return values
 
 
 def nearest_range(value: float, candidates: list) -> object:
@@ -158,6 +186,13 @@ def candidate_weight_kg(candidate: object) -> Optional[float]:
         if match:
             return float(match.group(1))
     return None
+
+
+def candidate_weight_lbs(candidate: object) -> Optional[float]:
+    """从候选描述中解析磅档，用于跨图表识别同一物理重量档。"""
+    description = str(getattr(candidate, "description", "") or "")
+    match = _WEIGHT_LBS_PATTERN.search(description)
+    return float(match.group(1)) if match else None
 
 
 def select_weight_range(

@@ -105,8 +105,9 @@ _backend = None
 
 
 def _detect_backend():
+    embed_base = settings.VLLM_EMBED_BASE_URL or settings.VLLM_BASE_URL
     try:
-        r = httpx.get(f"{settings.VLLM_BASE_URL}/models", timeout=3,
+        r = httpx.get(f"{embed_base.rstrip('/')}/models", timeout=3,
                        headers={"Authorization": f"Bearer {settings.VLLM_API_KEY}"})
         if r.status_code == 200:
             return "vllm"
@@ -142,7 +143,9 @@ def _get_extra_headers() -> dict:
 def get_embed_backend() -> EmbedBackend:
     # 优先用独立 embedding 端点;未配置则回退到对话端点 VLLM_BASE_URL
     embed_base = settings.VLLM_EMBED_BASE_URL or settings.VLLM_BASE_URL
-    forced = settings.LLM_BACKEND.lower()
+    # 向量后端与聊天后端独立。例如聊天使用 DeepSeek 时，仍可显式指定
+    # EMBED_BACKEND=ollama 或 vllm；auto 才执行可用性探测。
+    forced = settings.EMBED_BACKEND.lower()
     if forced == "vllm":
         return _OpenAIEmbed(embed_base, settings.VLLM_API_KEY, settings.VLLM_EMBED_MODEL)
     elif forced == "custom":

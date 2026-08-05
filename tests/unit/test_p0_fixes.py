@@ -11,6 +11,7 @@ from stds.data.charts_loader import load_charts
 from stds.data.common_chart import load_common_chart, match_common_chart
 from stds.domain.models import Source, StdsElement, StdsResult
 from stds.engine.decision_codec import decode, decode_with_trace
+from stds.experience.models import CommonChartEntry, CommonChartKind
 from stds.llm.prompts import load_prompt
 
 
@@ -64,9 +65,33 @@ def test_common_chart_short_keyword_rejected():
     assert hit is None  # "拿取"只有2 字符
 
 
-def test_resolver_common_chart_fast_path():
+def _uploaded_turn_common():
+    return CommonChartEntry(
+        operation_label="转身90度",
+        normalized_operation="转身90度",
+        chartcode="202 010",
+        decision="T,90,NB",
+        cv="V",
+        frequency=1.0,
+        source_time_s=0.72,
+        time_s=0.72,
+        keywords=("转身90度",),
+        normalized_keywords=("转身90度",),
+        row=2,
+        kind=CommonChartKind.FORMULA,
+        values={2: 0.012, 3: 0.0},
+    )
+
+
+def test_resolver_uploaded_common_chart_fast_path():
     charts = load_charts()
-    deps = Deps(charts=charts, cache=AutoCache(), use_common_chart=True)
+    deps = Deps(
+        charts=charts,
+        cache=AutoCache(),
+        common_entries=(_uploaded_turn_common(),),
+        use_common_chart=True,
+        experience_scope="upload:test",
+    )
     el = StdsElement(1, "转身90度", "L", "S", freq=1.0, norm_key="转身90度")
     res = asyncio.run(resolve(el, deps))
     assert res.source == Source.CACHE and res.chartcode == "202 010"
@@ -86,7 +111,7 @@ def test_resolver_defaults_to_common_chart_disabled():
     el = StdsElement(1, "转身90度", "L", "S", freq=1.0, norm_key="转身90度")
     res = asyncio.run(resolve(el, deps))
 
-    assert deps.common_rows == []
+    assert deps.common_rows == ()
     assert res.source == Source.UNRESOLVED
     assert not any(
         isinstance(step, (list, tuple))
@@ -105,7 +130,16 @@ def test_disabling_common_chart_skips_its_existing_t0_cache():
     el = StdsElement(1, "转身90度", "L", "S", freq=1.0, norm_key="转身90度")
 
     enabled_result = asyncio.run(
-        resolve(el, Deps(charts=charts, cache=cache, use_common_chart=True))
+        resolve(
+            el,
+            Deps(
+                charts=charts,
+                cache=cache,
+                common_entries=(_uploaded_turn_common(),),
+                use_common_chart=True,
+                experience_scope="upload:test",
+            ),
+        )
     )
     disabled_result = asyncio.run(
         resolve(
@@ -113,7 +147,9 @@ def test_disabling_common_chart_skips_its_existing_t0_cache():
             Deps(
                 charts=charts,
                 cache=cache,
+                common_entries=(_uploaded_turn_common(),),
                 use_common_chart=False,
+                experience_scope="upload:test",
                 llm_select_chartcode=no_chartcode,
             ),
         )
@@ -133,7 +169,7 @@ def test_common_chart_as_t1_seed():
     idx = HistoryIndex(MockEmbed())
     rows = [{"操作内容": r["操作内容"], "动作代码": r["动作代码"], "决策描述": r["决策描述"] or ""} for r in load_common_chart()]
     idx.build_from_edited(rows)
-    hits = idx.knn("转身90度", k=3)
+    hits = asyncio.run(idx.knn("转身90度", k=3))
     assert hits[0].chartcode == "202 010"
 
 

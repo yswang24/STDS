@@ -12,6 +12,7 @@ encode: abbrevs -> 决策串(运行时产出用)。
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from stds.domain.models import MostChart, ValueOption
 from stds.engine.formula import EngineError
@@ -30,20 +31,68 @@ def encode(abbrevs: list) -> str:
     return ",".join(cleaned)
 
 
-def _match(token: str, opt: ValueOption) -> bool:
-    """L1 精确 + L2 数值精确。严禁 `in` 子串(会误配 T->NTT, 10->'4 in / 10 cm')。"""
-    if not token:
-        return False
-    ab = (opt.metric_abbrev or "").rstrip(",")
-    if token == ab:                                   # L1 精确(T->T, LS->LS, NB->NB)
-        return True
-    # L2:token 里的数字 == formula_value(精确数值,不用 description 避免误匹配)
-    nums = re.findall(r"[\d.]+", token)
-    for n in nums:
-        fv = float(n)
-        if opt.formula_value > 0 and abs(fv - opt.formula_value) < 0.001:
-            return True
-    return False
+_TOKEN_ALIASES = {
+    # 旧经验文件中的 No Additional Reach 缩写；当前数据库使用 NARX。
+    "NAR": "NARX",
+}
+_NUMBER_RE = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)")
+
+
+def _normalized_token(value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip().upper()
+    return text.rstrip(",").strip()
+
+
+def _canonical_token(value: object) -> str:
+    token = _normalized_token(value)
+    return _TOKEN_ALIASES.get(token, token)
+
+
+def canonicalize_decision(decision: str) -> str:
+    """规范化已知旧缩写，同时保留决策串中的空槽位和尾逗号。"""
+    return ",".join(
+        _canonical_token(token) if str(token).strip() else ""
+        for token in str(decision or "").split(",")
+    )
+
+
+def _exact_matches(token: str, cands: list[ValueOption]) -> list[ValueOption]:
+    """L1：必须先在全部候选中完成缩写精确匹配。"""
+    canonical = _canonical_token(token)
+    if not canonical:
+        return []
+    return [
+        option
+        for option in cands
+        if _canonical_token(option.metric_abbrev) == canonical
+    ]
+
+
+def _numeric_matches(token: str, cands: list[ValueOption]) -> list[ValueOption]:
+    """L2：只有 L1 全部未命中后，才按公式值做数字退化匹配。"""
+    numbers = [float(value) for value in _NUMBER_RE.findall(token or "")]
+    if not numbers:
+        return []
+    return [
+        option
+        for option in cands
+        if option.formula_value > 0
+        and any(
+            abs(number - option.formula_value) < 0.001
+            for number in numbers
+        )
+    ]
+
+
+def _token_choice(token: str, cands: list[ValueOption]) -> tuple:
+    """返回(choice, match_level, ambiguous)，严格执行全候选 L1→L2。"""
+    exact = _exact_matches(token, cands)
+    if exact:
+        return exact[0], "abbrev-exact", len(exact) > 1
+    numeric = _numeric_matches(token, cands)
+    if numeric:
+        return numeric[0], "formula-value-numeric", len(numeric) > 1
+    return None, "", False
 
 
 def _default_option(cands: list) -> tuple:
@@ -52,6 +101,8 @@ def _default_option(cands: list) -> tuple:
     2. description 精确 'No' 或 '0'(乘法因子类变量,如 050 05D V2 No/fv=1.0)
     3. 最小 fv(最后手段,标 low_conf)
     """
+    if len(cands) == 1:
+        return cands[0], False
     zeros = [o for o in cands if o.formula_value == 0.0]
     if zeros:
         return zeros[0], False
@@ -77,12 +128,15 @@ def _decode(chart: MostChart, decision: str) -> tuple:
             raise EngineError(f"no cands {chart.chartcode} V{var}R{rng}")
         choice = None
         matched_token = None
+        match_level = ""
+        ambiguous_match = False
         if ti < len(tokens):
-            for opt in cands:
-                if _match(tokens[ti], opt):
-                    choice = opt
-                    matched_token = tokens[ti]
-                    break
+            choice, match_level, ambiguous_match = _token_choice(
+                tokens[ti],
+                cands,
+            )
+            if choice is not None:
+                matched_token = tokens[ti]
         if choice is None:
             choice, lc = _default_option(cands)        # ★ 修正:fv=0 优先
             low_conf = low_conf or lc
@@ -99,7 +153,12 @@ def _decode(chart: MostChart, decision: str) -> tuple:
                 reason += f";unmatched-token={waiting_token}"
         else:
             ti += 1
-            reason = f"decision-token={matched_token}"
+            low_conf = low_conf or ambiguous_match
+            reason = (
+                f"decision-token={matched_token};match={match_level}"
+            )
+            if ambiguous_match:
+                reason += ";ambiguous-candidates(low-confidence)"
         values[var] = choice.formula_value
         trace.append((f"V{var}", choice.description, reason))
         var, rng = choice.next_variable, choice.next_range or 1
@@ -119,3 +178,16 @@ def decode(chart: MostChart, decision: str) -> tuple:
 def decode_with_trace(chart: MostChart, decision: str) -> tuple:
     """返回 (values, low_conf, trace)，供快速路径输出逐变量审计轨迹。"""
     return _decode(chart, decision)
+
+
+def decode_strict_with_trace(chart: MostChart, decision: str) -> tuple:
+    """严格解码；任何默认歧义或未消费 token 都视为无效决策。"""
+    values, low_confidence, trace = _decode(
+        chart,
+        canonicalize_decision(decision),
+    )
+    if low_confidence:
+        raise EngineError(
+            f"low-confidence decision {chart.chartcode}: {decision!r}"
+        )
+    return values, trace

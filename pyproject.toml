@@ -6,6 +6,7 @@ dependencies = [
     "pydantic>=2",
     "httpx>=0.24",
     "fastapi>=0.100",
+    "python-multipart>=0.0.9",
     "uvicorn>=0.20",
     "sse-starlette>=1.0",
     "sqlalchemy>=2.0",

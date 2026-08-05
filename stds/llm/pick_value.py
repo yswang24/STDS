@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from pydantic import BaseModel
 
@@ -11,6 +11,9 @@ from stds.cascade import numeric
 from stds.domain.models import ValueOption
 from stds.llm.client import structured
 from stds.llm.prompts import render_prompt
+
+if TYPE_CHECKING:
+    from stds.retrieval.model_weight_pool import ModelWeightPool
 
 logger = logging.getLogger("stds.llm.pick_value")
 
@@ -104,6 +107,19 @@ def _experience_default_choice(experience_hint: object, candidates: list):
     hint = str(experience_hint or "").strip()
     if not hint:
         return None
+
+    # Loader 允许参数单元格直接写候选值（例如 ``Turn``、``180``、
+    # ``No Bend``）。这类提示本身就是完整选择，不应再次交给 LLM；否则
+    # 同一份参数经验会因模型波动偶尔选到其他档。含条件、选择语句或多个
+    # 分句的自然语言仍按下面的保守规则处理。
+    if not re.search(
+        r"(?:如果|若|否则|当|默认|缺省|选择|采用|使用|取|[；;。\n，,])",
+        hint,
+        re.I,
+    ):
+        direct = _candidate_for_default(hint, candidates)
+        if direct is not None:
+            return direct
 
     # 同一提示若还明确选择了其他候选，说明它包含条件分支。此时不能
     # 无条件套用默认值，交给 LLM 结合操作描述判断分支。
@@ -223,6 +239,8 @@ async def pick_value(
     experience_hint: Optional[str] = None,
     experience_context=None,
     experience_source: str = "",
+    part_identity_context=None,
+    model_weight_pool: Optional["ModelWeightPool"] = None,
 ) -> tuple:
     """(ValueOption, confidence, reason)。
 
@@ -258,9 +276,7 @@ async def pick_value(
             return hit, 0.98, reason
 
     # 数值精确匹配(操作描述有明确数值,如"7m"、"18in")
-    n = numeric.parse_numeric(op_des)
-    if n:
-        kind, val = n
+    for kind, val in numeric.parse_numerics(op_des):
         hit = numeric.select_numeric_range(kind, val, candidates)
         if hit is not None:
             logger.debug(
@@ -330,11 +346,36 @@ async def pick_value(
         menu=menu,
         experience=experience_block,
     )
-    out: ValuePick = await structured(prompt, ValuePick)
-    idx = min(max(out.index, 0), len(candidates) - 1)
-    chosen = candidates[idx]
-    logger.debug(f"  [pick] LLM 选择: [{idx}] {chosen.description} (fv={chosen.formula_value}, reason={out.reason})")
-    reason = out.reason
-    if experience_reason:
-        reason = f"experience-assisted:{experience_reason};llm_reason={out.reason}"
-    return chosen, 0.7, reason
+    async def choose_with_llm() -> tuple:
+        out: ValuePick = await structured(prompt, ValuePick)
+        idx = min(max(out.index, 0), len(candidates) - 1)
+        chosen = candidates[idx]
+        logger.debug(
+            "  [pick] LLM 选择: [%s] %s (fv=%s, reason=%s)",
+            idx,
+            chosen.description,
+            chosen.formula_value,
+            out.reason,
+        )
+        reason = out.reason
+        if experience_reason:
+            reason = (
+                f"experience-assisted:{experience_reason};"
+                f"llm_reason={out.reason}"
+            )
+        return chosen, 0.7, reason
+
+    # Only the final LLM fallback participates.  The pool performs its own
+    # identity and all-candidates-are-kilogram-bands checks, so existing callers
+    # and non-weight variables retain their exact behavior.
+    if (
+        model_weight_pool is not None
+        and part_identity_context is not None
+        and model_weight_pool.supports(part_identity_context, candidates)
+    ):
+        return await model_weight_pool.resolve(
+            part_identity_context,
+            candidates,
+            choose_with_llm,
+        )
+    return await choose_with_llm()

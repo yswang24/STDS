@@ -3,20 +3,22 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from stds.data.cache import decision_cache_scope
+
 
 def on_review_confirmed(el, result, deps):
     """复核结果回灌 T0 缓存 + T1 检索索引 + golden 池。"""
     result.edited = True
     unit_time = result.time_s / (result.freq or 1.0)
     cache_template = replace(result, time_s=unit_time, freq=1.0)
-    experience_scope = getattr(deps, "experience_scope", "") or ""
-    if experience_scope:
+    cache_scope = decision_cache_scope(deps)
+    if cache_scope:
         try:
             deps.cache.put(
                 el.norm_key,
                 cache_template,
-                scope=experience_scope,
-            )                                            # 同经验版本内复用
+                scope=cache_scope,
+            )                                            # 同一决策环境内复用
         except TypeError:
             # 旧自定义缓存不支持 namespace 时宁可不回灌，也不能跨经验串用。
             pass

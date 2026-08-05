@@ -1512,8 +1512,17 @@ async def _resolve_parent_weight_groups(
             )
             if manual_index in resolution.contexts
         }
+        identity_contexts = {
+            detail.child_index: resolution.identity_contexts[manual_index]
+            for manual_index, detail in enumerate(
+                representative_manual_details,
+                start=1,
+            )
+            if manual_index in resolution.identity_contexts
+        }
         scoped_resolution = PartWeightGroupResolution(
             contexts=contexts,
+            identity_contexts=identity_contexts,
             attempted=resolution.attempted,
         )
         for row in group:
@@ -1581,11 +1590,24 @@ async def analyze_decomposition_output(
         )
         repeated_by_child: dict[int, RepeatedActionGroup] = {}
         for candidate in repeated_resolution.groups:
-            context_partitions: dict[Optional[int], list[int]] = {}
+            context_partitions: dict[
+                tuple[Optional[int], Optional[int]],
+                list[int],
+            ] = {}
             for child_index in candidate.child_indexes:
                 context = weight_resolution.contexts.get(child_index)
-                context_scope = id(context) if context is not None else None
-                context_partitions.setdefault(context_scope, []).append(child_index)
+                identity_context = weight_resolution.identity_contexts.get(
+                    child_index
+                )
+                context_scope = (
+                    id(context) if context is not None else None,
+                    id(identity_context)
+                    if identity_context is not None
+                    else None,
+                )
+                context_partitions.setdefault(context_scope, []).append(
+                    child_index
+                )
             for child_indexes in context_partitions.values():
                 if len(child_indexes) > 1:
                     for child_index in child_indexes:
@@ -1594,6 +1616,11 @@ async def analyze_decomposition_output(
             is_manual = detail.effective_actor == "人工"
             numeric_context = (
                 weight_resolution.contexts.get(detail.child_index)
+                if is_manual
+                else None
+            )
+            part_identity_context = (
+                weight_resolution.identity_contexts.get(detail.child_index)
                 if is_manual
                 else None
             )
@@ -1607,6 +1634,11 @@ async def analyze_decomposition_output(
                 if numeric_context is not None
                 else None
             )
+            identity_scope = (
+                id(part_identity_context)
+                if part_identity_context is not None
+                else None
+            )
             repeated_group = repeated_by_child.get(detail.child_index)
             if repeated_group is None:
                 analysis_operation = detail.operation
@@ -1616,6 +1648,7 @@ async def analyze_decomposition_output(
                     normalize(detail.operation) or detail.operation,
                     weight_scope,
                     numeric_scope,
+                    identity_scope,
                 )
             else:
                 analysis_operation = repeated_group.canonical_operation
@@ -1627,6 +1660,7 @@ async def analyze_decomposition_output(
                     normalize(analysis_operation) or analysis_operation,
                     weight_scope,
                     numeric_scope,
+                    identity_scope,
                 )
             unit = grouped_detail_units.get(key)
             if unit is None:
@@ -1674,6 +1708,13 @@ async def analyze_decomposition_output(
                     effective_actor,
                     numeric_context=(
                         weight_resolution.contexts.get(
+                            representative.child_index
+                        )
+                        if is_manual
+                        else None
+                    ),
+                    part_identity_context=(
+                        weight_resolution.identity_contexts.get(
                             representative.child_index
                         )
                         if is_manual

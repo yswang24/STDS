@@ -10,6 +10,7 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional
 
+from stds.domain.chartcode_policy import is_experience_only_chartcode
 from stds.retrieval.embed import EmbedBackend
 
 
@@ -37,9 +38,14 @@ class HistoryIndex:
 
     def build_from_edited(self, edited_rows: list):
         """从 已人工编辑='是' 的记录构建索引。只取 chartcode + 决策描述,不取时间。"""
-        texts = [r["操作内容"] for r in edited_rows]
+        eligible_rows = [
+            row
+            for row in edited_rows
+            if not is_experience_only_chartcode(row.get("动作代码"))
+        ]
+        texts = [r["操作内容"] for r in eligible_rows]
         vecs = self._embed.embed(texts) if texts else []
-        for r, v in zip(edited_rows, vecs):
+        for r, v in zip(eligible_rows, vecs):
             self._texts.append(r["操作内容"])
             self._metas.append((r["动作代码"], r["决策描述"]))
             self._vecs.append(v)
@@ -63,6 +69,8 @@ class HistoryIndex:
 
     def add(self, text: str, result) -> None:
         """飞轮回灌:复核确认后立即加入索引(复核为单次操作,同步可接受)。"""
+        if is_experience_only_chartcode(getattr(result, "chartcode", None)):
+            return
         vec = self._embed.embed_one(text)
         self._texts.append(text)
         self._metas.append((result.chartcode, result.decision))

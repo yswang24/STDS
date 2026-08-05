@@ -6,6 +6,7 @@ import hashlib
 
 import pytest
 
+from stds.config.settings import settings
 from stds.llm.decompose import (
     DIFY_INPUT_PLACEHOLDER,
     DecomposeOut,
@@ -17,6 +18,8 @@ from stds.llm.client import (
     OLLAMA_SYSTEM_EXECUTION_PROMPT,
     _OllamaClient,
     _OpenAIClient,
+    _detect_backend,
+    _make_client,
     get_llm_runtime_options,
     llm_runtime,
     structured_system,
@@ -170,6 +173,122 @@ def test_vllm_client_falls_back_to_legacy_guided_json(monkeypatch):
     assert payloads[0]["response_format"]["type"] == "json_schema"
     assert payloads[1]["guided_json"] == DecomposeOut.model_json_schema()
     assert "response_format" not in payloads[1]
+
+
+def test_deepseek_client_uses_official_openai_compatible_contract(monkeypatch):
+    captured = {}
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": '{"operation":["操作人员拿取零件"]}'}}
+                ]
+            }
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["headers"] = kwargs["headers"]
+        captured["payload"] = kwargs["json"]
+        return Response()
+
+    monkeypatch.setattr(
+        "stds.llm.client.settings.DEEPSEEK_API_BASE_URL",
+        "https://api.deepseek.com/",
+    )
+    monkeypatch.setattr(
+        "stds.llm.client.settings.DEEPSEEK_API_KEY",
+        "deepseek-test-key",
+    )
+    monkeypatch.setattr(
+        "stds.llm.client.settings.DEEPSEEK_LLM_MODEL",
+        "deepseek-v4-flash",
+    )
+    monkeypatch.setattr("stds.llm.client.httpx.post", fake_post)
+
+    result = asyncio.run(
+        _make_client("deepseek").structured("拆解", DecomposeOut, retries=0)
+    )
+
+    assert result.operation == ["操作人员拿取零件"]
+    assert captured["url"] == "https://api.deepseek.com/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer deepseek-test-key"
+    assert captured["payload"]["model"] == "deepseek-v4-flash"
+    assert captured["payload"]["response_format"] == {"type": "json_object"}
+    assert captured["payload"]["stream"] is False
+
+
+def test_auto_detection_prefers_configured_deepseek_over_custom(monkeypatch):
+    requested_urls = []
+
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    def fake_get(url, **kwargs):
+        requested_urls.append(url)
+        return Response(200 if url == "https://api.deepseek.com/models" else 404)
+
+    monkeypatch.setattr(
+        "stds.llm.client.settings.DEEPSEEK_API_BASE_URL",
+        "https://api.deepseek.com",
+    )
+    monkeypatch.setattr(
+        "stds.llm.client.settings.DEEPSEEK_API_KEY",
+        "deepseek-test-key",
+    )
+    monkeypatch.setattr("stds.llm.client.httpx.get", fake_get)
+
+    assert _detect_backend() == "deepseek"
+    assert requested_urls == [
+        f"{settings.VLLM_BASE_URL}/models",
+        "https://api.deepseek.com/models",
+    ]
+
+
+def test_deepseek_omits_json_mode_when_exact_prompt_lacks_json_keyword(monkeypatch):
+    captured = {}
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": '{"operation":["操作人员安装零件"]}'}}
+                ]
+            }
+
+    def fake_post(url, **kwargs):
+        captured.update(kwargs["json"])
+        return Response()
+
+    monkeypatch.setattr(
+        "stds.llm.client.settings.DEEPSEEK_API_KEY",
+        "deepseek-test-key",
+    )
+    monkeypatch.setattr("stds.llm.client.httpx.post", fake_post)
+
+    result = asyncio.run(
+        _make_client("deepseek").structured(
+            "只返回指定对象",
+            DecomposeOut,
+            retries=0,
+            exact_system_prompt=True,
+        )
+    )
+
+    assert result.operation == ["操作人员安装零件"]
+    assert "response_format" not in captured
+
+
+def test_deepseek_client_requires_api_key(monkeypatch):
+    monkeypatch.setattr("stds.llm.client.settings.DEEPSEEK_API_KEY", "")
+
+    with pytest.raises(LLMError, match="DEEPSEEK_API_KEY"):
+        _make_client("deepseek")
 
 
 def test_openai_error_response_reports_real_service_message(monkeypatch):

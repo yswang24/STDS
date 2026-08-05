@@ -32,7 +32,7 @@ def test_chartcode_index_retrieve():
     embed = MockEmbed()
     idx = ChartcodeIndex(embed)
     idx.build(charts)
-    cand = idx.retrieve("Place or Reposition Nut Runner", k=3)
+    cand = asyncio.run(idx.retrieve("Place or Reposition Nut Runner", k=3))
     assert len(cand.topk) == 3
     # MockEmbed 非语义,只验证逻辑:返回有效 chartcode + score
     for code, score in cand.topk:
@@ -47,7 +47,7 @@ def test_chartcode_index_confident():
     idx.build(charts)
     # 自身标题应该高分(因为 MockEmbed 确定性)
     title = charts["060 010"].title
-    cand = idx.retrieve(title, k=3)
+    cand = asyncio.run(idx.retrieve(title, k=3))
     assert cand.topk[0][1] > 0.9  # 自身相似度极高
 
 
@@ -61,7 +61,7 @@ def test_history_index_build_and_knn():
     if not edited:
         pytest.skip("无已编辑历史记录")
     idx.build_from_edited(edited)
-    hits = idx.knn(edited[0]["操作内容"], k=3)
+    hits = asyncio.run(idx.knn(edited[0]["操作内容"], k=3))
     assert len(hits) > 0
     assert hits[0].score >= 0.99  # 自身相似度
 
@@ -72,7 +72,7 @@ def test_history_index_add():
     el = StdsElement(1, "拿取泡棉", "L", "S")
     result = StdsResult(el, "050 221", "SIM,18IN,0.5LBS,18IN,NAR,", 6.48, "V", 6.0, Source.KNN, 1.0, False)
     idx.add("拿取泡棉", result)
-    hits = idx.knn("拿取泡棉", k=1)
+    hits = asyncio.run(idx.knn("拿取泡棉", k=1))
     assert len(hits) == 1
     assert hits[0].chartcode == "050 221"
 

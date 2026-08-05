@@ -8,7 +8,12 @@ from stds.cascade.numeric import (
     candidate_weight_kg,
     select_weight_range,
 )
-from stds.cascade.resolver import Deps, resolve, resolve_part_weight_groups
+from stds.cascade.resolver import (
+    Deps,
+    _part_weight_context,
+    resolve,
+    resolve_part_weight_groups,
+)
 from stds.data.cache import AutoCache
 from stds.data.charts_loader import load_charts
 from stds.domain.models import (
@@ -320,6 +325,487 @@ def test_parent_group_matches_weight_once_and_shares_same_context_object():
     assert {context.group_id for context in resolution.contexts.values()} == {
         "G1"
     }
+
+
+def test_two_parents_share_one_request_weight_match_but_keep_local_contexts():
+    match_calls = 0
+
+    class WeightIndex:
+        available = True
+
+        async def match(self, query):
+            nonlocal match_calls
+            match_calls += 1
+            await asyncio.sleep(0)
+            return PartWeightMatch(
+                query=query,
+                matched_name="低压线束",
+                part_no="P1",
+                weight_kg=0.095,
+                similarity=0.96,
+                match_type="semantic",
+                sources=(PartWeightSource("DU", 40, "E40"),),
+            )
+
+    async def extract_groups(parent, children):
+        return (
+            PartOperationGroup(
+                part_name="主低压线束",
+                child_indexes=[1],
+                reason=parent,
+            ),
+        )
+
+    deps = Deps(
+        charts={},
+        cache=AutoCache(),
+        part_weight_index=WeightIndex(),
+        llm_extract_part_groups=extract_groups,
+    )
+
+    async def scenario():
+        return await asyncio.gather(
+            resolve_part_weight_groups(
+                "人工A拿取主低压线束",
+                ("拿取主低压线束",),
+                deps,
+            ),
+            resolve_part_weight_groups(
+                "人工B安装主低压线束",
+                ("安装主低压线束",),
+                deps,
+            ),
+        )
+
+    first, second = asyncio.run(scenario())
+
+    assert match_calls == 1
+    assert first.contexts[1].weight_kg == second.contexts[1].weight_kg == 0.095
+    assert first.contexts[1] is not second.contexts[1]
+    assert first.contexts[1].query_name == "主低压线束"
+    assert second.contexts[1].query_name == "主低压线束"
+
+
+def test_direct_and_parent_group_weight_paths_share_request_pool():
+    match_calls = 0
+
+    class WeightIndex:
+        available = True
+
+        async def match(self, query):
+            nonlocal match_calls
+            match_calls += 1
+            return PartWeightMatch(
+                query=query,
+                matched_name="低压线束",
+                part_no="P1",
+                weight_kg=0.095,
+                similarity=0.96,
+                match_type="semantic",
+                sources=(),
+            )
+
+    async def extract_name(_):
+        return "主低压线束"
+
+    async def extract_groups(parent, children):
+        return (
+            PartOperationGroup(
+                part_name="主 低压线束",
+                child_indexes=[1],
+                reason="同一零件",
+            ),
+        )
+
+    deps = Deps(
+        charts={},
+        cache=AutoCache(),
+        part_weight_index=WeightIndex(),
+        llm_extract_part_name=extract_name,
+        llm_extract_part_groups=extract_groups,
+    )
+
+    async def scenario():
+        direct = await _part_weight_context("人工A拿取主低压线束", deps)
+        grouped = await resolve_part_weight_groups(
+            "人工A安装主低压线束",
+            ("安装主低压线束",),
+            deps,
+        )
+        return direct, grouped.contexts[1]
+
+    direct, grouped = asyncio.run(scenario())
+
+    assert match_calls == 1
+    assert direct is not None
+    assert direct is not grouped
+    assert direct.query_name == "主低压线束"
+    assert grouped.query_name == "主 低压线束"
+    assert direct.weight_kg == grouped.weight_kg == 0.095
+
+
+def test_request_weight_pool_single_flights_and_caches_clean_none():
+    match_calls = 0
+    deps = Deps(charts={}, cache=AutoCache())
+
+    async def matcher(query):
+        nonlocal match_calls
+        match_calls += 1
+        await asyncio.sleep(0.01)
+        return None
+
+    async def scenario():
+        results = await asyncio.gather(
+            deps.part_weight_pool.match("主低压线束", matcher),
+            deps.part_weight_pool.match("主 低压线束", matcher),
+            deps.part_weight_pool.match("主低压线束", matcher),
+        )
+        cached = await deps.part_weight_pool.match("主低压线束", matcher)
+        return results, cached
+
+    results, cached = asyncio.run(scenario())
+
+    assert results == [None, None, None]
+    assert cached is None
+    assert match_calls == 1
+
+
+def test_request_weight_pool_does_not_cache_exception_or_cancellation():
+    deps = Deps(charts={}, cache=AutoCache())
+    exception_calls = 0
+    cancellation_calls = 0
+
+    async def exception_matcher(query):
+        nonlocal exception_calls
+        exception_calls += 1
+        if exception_calls == 1:
+            raise RuntimeError("temporary")
+        return PartWeightMatch(
+            query=query,
+            matched_name="低压线束",
+            part_no="P1",
+            weight_kg=0.095,
+            similarity=1.0,
+            match_type="exact",
+            sources=(),
+        )
+
+    async def cancellation_matcher(query):
+        nonlocal cancellation_calls
+        cancellation_calls += 1
+        if cancellation_calls == 1:
+            raise asyncio.CancelledError
+        return PartWeightMatch(
+            query=query,
+            matched_name="水冷板",
+            part_no="P2",
+            weight_kg=6.5,
+            similarity=1.0,
+            match_type="exact",
+            sources=(),
+        )
+
+    async def scenario():
+        try:
+            await deps.part_weight_pool.match("低压线束别名", exception_matcher)
+        except RuntimeError:
+            pass
+        retried_exception = await deps.part_weight_pool.match(
+            "低压线束别名",
+            exception_matcher,
+        )
+        try:
+            await deps.part_weight_pool.match("主水冷板", cancellation_matcher)
+        except asyncio.CancelledError:
+            pass
+        retried_cancellation = await deps.part_weight_pool.match(
+            "主水冷板",
+            cancellation_matcher,
+        )
+        return retried_exception, retried_cancellation
+
+    retried_exception, retried_cancellation = asyncio.run(scenario())
+
+    assert exception_calls == 2
+    assert cancellation_calls == 2
+    assert retried_exception.weight_kg == 0.095
+    assert retried_cancellation.weight_kg == 6.5
+
+
+def test_request_weight_pool_unifies_aliases_by_part_number_or_matched_name():
+    async def run_case(
+        *,
+        first_part_no,
+        second_part_no,
+        first_matched_name,
+        second_matched_name,
+    ):
+        calls = []
+        deps = Deps(charts={}, cache=AutoCache())
+
+        async def matcher(query):
+            calls.append(query)
+            if len(calls) == 1:
+                return PartWeightMatch(
+                    query=query,
+                    matched_name=first_matched_name,
+                    part_no=first_part_no,
+                    weight_kg=0.095,
+                    similarity=0.96,
+                    match_type="semantic",
+                    sources=(),
+                )
+            return PartWeightMatch(
+                query=query,
+                matched_name=second_matched_name,
+                part_no=second_part_no,
+                weight_kg=9.9,
+                similarity=0.95,
+                match_type="semantic",
+                sources=(),
+            )
+
+        first = await deps.part_weight_pool.match("别名甲", matcher)
+        second = await deps.part_weight_pool.match("别名乙", matcher)
+        standard_name = await deps.part_weight_pool.match(
+            second_matched_name,
+            matcher,
+        )
+        return first, second, standard_name, calls
+
+    by_part_no = asyncio.run(
+        run_case(
+            first_part_no="P1",
+            second_part_no="P1",
+            first_matched_name="低压线束",
+            second_matched_name="LOW VOLTAGE HARNESS",
+        )
+    )
+    by_matched_name = asyncio.run(
+        run_case(
+            first_part_no="",
+            second_part_no="",
+            first_matched_name="低压线束",
+            second_matched_name="低压线束",
+        )
+    )
+
+    for first, second, standard_name, calls in (by_part_no, by_matched_name):
+        assert calls == ["别名甲", "别名乙"]
+        assert second is first
+        assert standard_name is first
+        assert second.weight_kg == 0.095
+
+
+def test_cached_none_is_not_overwritten_by_later_matched_name_alias():
+    deps = Deps(charts={}, cache=AutoCache())
+    calls = []
+
+    async def matcher(query):
+        calls.append(query)
+        if query == "模块":
+            return None
+        return PartWeightMatch(
+            query=query,
+            matched_name="模块",
+            part_no="P1",
+            weight_kg=1.5,
+            similarity=0.96,
+            match_type="semantic",
+            sources=(),
+        )
+
+    async def scenario():
+        before = await deps.part_weight_pool.match("模块", matcher)
+        alias = await deps.part_weight_pool.match("模块别名", matcher)
+        after = await deps.part_weight_pool.match("模块", matcher)
+        return before, alias, after
+
+    before, alias, after = asyncio.run(scenario())
+
+    assert calls == ["模块", "模块别名"]
+    assert before is None
+    assert alias.weight_kg == 1.5
+    assert after is None
+
+
+def test_same_matched_name_with_different_part_numbers_does_not_merge():
+    deps = Deps(charts={}, cache=AutoCache())
+
+    async def matcher(query):
+        if query == "模块甲别名":
+            return PartWeightMatch(
+                query=query,
+                matched_name="模块",
+                part_no="P1",
+                weight_kg=1.0,
+                similarity=0.96,
+                match_type="semantic",
+                sources=(),
+            )
+        return PartWeightMatch(
+            query=query,
+            matched_name="模块",
+            part_no="P2",
+            weight_kg=2.0,
+            similarity=0.96,
+            match_type="semantic",
+            sources=(),
+        )
+
+    async def scenario():
+        first = await deps.part_weight_pool.match("模块甲别名", matcher)
+        second = await deps.part_weight_pool.match("模块乙别名", matcher)
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first.weight_kg == 1.0
+    assert second.weight_kg == 2.0
+    assert first is not second
+
+
+def test_part_number_identity_preserves_punctuation():
+    deps = Deps(charts={}, cache=AutoCache())
+
+    async def matcher(query):
+        if query == "连字符零件":
+            return PartWeightMatch(
+                query=query,
+                matched_name="模块甲",
+                part_no="P-1",
+                weight_kg=1.0,
+                similarity=1.0,
+                match_type="exact",
+                sources=(),
+            )
+        return PartWeightMatch(
+            query=query,
+            matched_name="模块乙",
+            part_no="P1",
+            weight_kg=2.0,
+            similarity=1.0,
+            match_type="exact",
+            sources=(),
+        )
+
+    async def scenario():
+        first = await deps.part_weight_pool.match("连字符零件", matcher)
+        second = await deps.part_weight_pool.match("无连字符零件", matcher)
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first.part_no == "P-1"
+    assert second.part_no == "P1"
+    assert first.weight_kg == 1.0
+    assert second.weight_kg == 2.0
+
+
+def test_published_query_result_never_changes_after_later_alias_match():
+    deps = Deps(charts={}, cache=AutoCache())
+    calls = []
+
+    async def matcher(query):
+        calls.append(query)
+        if query == "模块":
+            return PartWeightMatch(
+                query=query,
+                matched_name="模块",
+                part_no="P1",
+                weight_kg=1.0,
+                similarity=1.0,
+                match_type="exact",
+                sources=(),
+            )
+        return PartWeightMatch(
+            query=query,
+            matched_name="模块",
+            part_no="P2",
+            weight_kg=9.0,
+            similarity=0.96,
+            match_type="semantic",
+            sources=(),
+        )
+
+    async def scenario():
+        before = await deps.part_weight_pool.match("模块", matcher)
+        later = await deps.part_weight_pool.match("另一模块别名", matcher)
+        after = await deps.part_weight_pool.match("模块", matcher)
+        return before, later, after
+
+    before, later, after = asyncio.run(scenario())
+
+    assert calls == ["模块", "另一模块别名"]
+    assert before.weight_kg == after.weight_kg == 1.0
+    assert after is before
+    assert later.weight_kg == 9.0
+
+
+def test_same_part_number_with_different_names_keeps_first_reliable_weight():
+    deps = Deps(charts={}, cache=AutoCache())
+
+    async def matcher(query):
+        if query == "中文别名":
+            return PartWeightMatch(
+                query=query,
+                matched_name="低压线束",
+                part_no="LV-001",
+                weight_kg=0.095,
+                similarity=0.96,
+                match_type="semantic",
+                sources=(),
+            )
+        return PartWeightMatch(
+            query=query,
+            matched_name="LOW VOLTAGE HARNESS",
+            part_no="LV-001",
+            weight_kg=9.9,
+            similarity=0.95,
+            match_type="semantic",
+            sources=(),
+        )
+
+    async def scenario():
+        first = await deps.part_weight_pool.match("中文别名", matcher)
+        second = await deps.part_weight_pool.match("English alias", matcher)
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert second is first
+    assert second.weight_kg == 0.095
+
+
+def test_weight_pools_are_isolated_between_deps_instances():
+    match_calls = 0
+    first_deps = Deps(charts={}, cache=AutoCache())
+    second_deps = Deps(charts={}, cache=AutoCache())
+
+    async def matcher(query):
+        nonlocal match_calls
+        match_calls += 1
+        return PartWeightMatch(
+            query=query,
+            matched_name="低压线束",
+            part_no="P1",
+            weight_kg=float(match_calls),
+            similarity=1.0,
+            match_type="exact",
+            sources=(),
+        )
+
+    async def scenario():
+        first = await first_deps.part_weight_pool.match("低压线束", matcher)
+        second = await second_deps.part_weight_pool.match("低压线束", matcher)
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first_deps.part_weight_pool is not second_deps.part_weight_pool
+    assert match_calls == 2
+    assert first.weight_kg == 1.0
+    assert second.weight_kg == 2.0
 
 
 def test_weight_band_uses_real_kg_text_and_ceiling_not_formula_value():

@@ -23,7 +23,7 @@ class LoadDiagnostics:
 
 
 def load_charts() -> dict:
-    """加载 62 个 MostChart。以 formula.ChartFormula 为准。"""
+    """加载 64 个 MostChart。以 formula.ChartFormula 为准。"""
     charts, _ = load_charts_with_diagnostics()
     return charts
 

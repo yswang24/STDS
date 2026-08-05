@@ -2,11 +2,27 @@
 from __future__ import annotations
 
 from stds.data.charts_loader import load_charts
+from stds.engine.decision_codec import decode
+from stds.engine.formula import evaluate
 
 
 def test_load_charts_count():
     charts = load_charts()
-    assert len(charts) == 62
+    assert len(charts) == 64
+
+
+def test_est_charts_are_standard_single_node_fixed_time_charts():
+    charts = load_charts()
+    for chartcode, expected_cv in (("EST C00", True), ("EST V00", False)):
+        chart = charts[chartcode]
+        candidates = chart.candidates(1, 1)
+        assert len(candidates) == 1
+        assert candidates[0].metric_abbrev == "5S"
+        assert candidates[0].next_variable == 0
+        assert chart.value_added is expected_cv
+        values, low_confidence = decode(chart, "5S")
+        assert low_confidence is False
+        assert evaluate(chart, values) == 5.0
 
 
 def test_020_02a_jump_and_terminator():

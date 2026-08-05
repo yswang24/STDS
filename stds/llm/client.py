@@ -1,6 +1,6 @@
-"""LLM 结构化输出封装。后端:auto / vllm / custom / ollama / mock。
+"""LLM 结构化输出封装。后端:auto / vllm / deepseek / custom / ollama / mock。
 
-vllm 和 custom 都是 OpenAI 兼容 API(/v1/chat/completions),只是配置不同。
+vllm、deepseek 和 custom 都是 OpenAI 兼容 API，只是配置不同。
 """
 from __future__ import annotations
 
@@ -27,7 +27,9 @@ class LLMError(Exception):
     pass
 
 
-SUPPORTED_LLM_BACKENDS = frozenset({"auto", "vllm", "custom", "ollama", "mock"})
+SUPPORTED_LLM_BACKENDS = frozenset(
+    {"auto", "vllm", "deepseek", "custom", "ollama", "mock"}
+)
 OLLAMA_SYSTEM_EXECUTION_PROMPT = (
     "请严格执行 system 中的任务，并且只输出符合指定 JSON Schema 的 JSON。"
 )
@@ -255,12 +257,14 @@ class _OpenAIClient:
         extra_headers: dict = None,
         *,
         vllm_json_schema: bool = False,
+        json_keyword_required: bool = False,
     ):
         self.base = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.extra_headers = extra_headers or {}
         self.vllm_json_schema = vllm_json_schema
+        self.json_keyword_required = json_keyword_required
 
     def _request_payload(
         self,
@@ -269,6 +273,7 @@ class _OpenAIClient:
         schema: Type[BaseModel],
         *,
         legacy_vllm: bool,
+        use_json_response_format: bool = True,
     ) -> dict:
         payload = {
             "model": model,
@@ -290,7 +295,7 @@ class _OpenAIClient:
                         "schema": json_schema,
                     },
                 }
-        else:
+        elif use_json_response_format:
             payload["response_format"] = {"type": "json_object"}
         return payload
 
@@ -315,6 +320,13 @@ class _OpenAIClient:
                 {"role": "user", "content": full_prompt},
             ]
         headers = {"Authorization": f"Bearer {self.api_key}", **self.extra_headers}
+        use_json_response_format = not (
+            self.json_keyword_required and "json" not in full_prompt.lower()
+        )
+        if not use_json_response_format:
+            logger.debug(
+                "[LLM] prompt 不含 JSON 关键字，按服务约束省略 response_format"
+            )
         logger.debug(f"[LLM] model={model} backend={self.base}")
         logger.debug(f"[LLM] prompt:\n{full_prompt[:500]}...")
         retry_count = 0
@@ -330,6 +342,7 @@ class _OpenAIClient:
                         messages,
                         schema,
                         legacy_vllm=legacy_vllm,
+                        use_json_response_format=use_json_response_format,
                     ),
                     timeout=120,
                 )
@@ -449,6 +462,20 @@ def _detect_backend():
             return "vllm"
     except Exception:
         pass
+    # DeepSeek
+    if settings.DEEPSEEK_API_KEY:
+        try:
+            r = httpx.get(
+                f"{settings.DEEPSEEK_API_BASE_URL.rstrip('/')}/models",
+                timeout=3,
+                headers={
+                    "Authorization": f"Bearer {settings.DEEPSEEK_API_KEY}"
+                },
+            )
+            if r.status_code == 200:
+                return "deepseek"
+        except Exception:
+            pass
     # Custom
     if settings.CUSTOM_API_BASE_URL and settings.CUSTOM_LLM_MODEL:
         try:
@@ -503,6 +530,17 @@ def _make_client(backend: str):
             settings.VLLM_API_KEY,
             settings.VLLM_LLM_MODEL,
             vllm_json_schema=True,
+        )
+    elif backend == "deepseek":
+        if not settings.DEEPSEEK_API_KEY.strip():
+            raise LLMError(
+                "DeepSeek API Key 未配置，请设置环境变量 DEEPSEEK_API_KEY"
+            )
+        return _OpenAIClient(
+            settings.DEEPSEEK_API_BASE_URL,
+            settings.DEEPSEEK_API_KEY,
+            settings.DEEPSEEK_LLM_MODEL,
+            json_keyword_required=True,
         )
     elif backend == "custom":
         return _OpenAIClient(

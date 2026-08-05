@@ -7,7 +7,7 @@ from __future__ import annotations
 import inspect
 from typing import Optional
 
-from stds.cascade.numeric import NumericContext
+from stds.cascade.numeric import NumericContext, PartIdentityContext
 from stds.domain.models import MostChart
 from stds.engine.formula import EngineError
 
@@ -58,6 +58,8 @@ async def traverse(
     pick_value,
     *,
     numeric_context: Optional[NumericContext] = None,
+    part_identity_context: Optional[PartIdentityContext] = None,
+    model_weight_pool=None,
     experience_context=None,
     experience_source: str = "",
 ):
@@ -80,6 +82,11 @@ async def traverse(
         picker_kwargs = {}
         if numeric_context is not None:
             picker_kwargs["numeric_context"] = numeric_context
+        if part_identity_context is not None and model_weight_pool is not None:
+            picker_kwargs.update(
+                part_identity_context=part_identity_context,
+                model_weight_pool=model_weight_pool,
+            )
         if experience_hint is not None:
             picker_kwargs.update(
                 experience_hint=experience_hint,

@@ -23,7 +23,6 @@ setup_logging(level="DEBUG", log_file="stds_debug.log")
 from stds.cascade.resolver import Deps
 from stds.data.cache import AutoCache
 from stds.data.charts_loader import load_charts
-from stds.data.common_chart import load_common_chart
 from stds.experience import load_experience_workbook
 from stds.llm.client import llm_runtime
 from stds.llm.pick_value import pick_value
@@ -54,14 +53,13 @@ from stds.ui.review_table import (
     normalize_review_editor_rows,
 )
 
-BATCH_OUTPUT_SCHEMA_VERSION = 15
-COMMON_CHART_SETTING_VERSION = 1
+BATCH_OUTPUT_SCHEMA_VERSION = 17
+COMMON_CHART_SETTING_VERSION = 3
 
 # ---------- 初始化(缓存到 session_state) ----------
 if "charts" not in st.session_state:
     st.session_state.charts = load_charts()
     st.session_state.cache = AutoCache()
-    st.session_state.common_rows = load_common_chart()
     st.session_state.history = []  # 分析历史
 if "part_weight_index" not in st.session_state:
     st.session_state.part_weight_index = load_part_weight_index()
@@ -80,10 +78,18 @@ if "experience_load_key" not in st.session_state:
     st.session_state.experience_load_key = None
     st.session_state.experience_load_result = None
     st.session_state.experience_load_error = ""
-    st.session_state.active_experience_digest = None
+if "active_experience_key" not in st.session_state:
+    st.session_state.active_experience_key = None
 if st.session_state.get("common_chart_setting_version") != COMMON_CHART_SETTING_VERSION:
-    st.session_state.use_common_chart = False
+    st.session_state.use_common_chart = True
+    st.session_state.use_semantic_experience = True
     st.session_state.common_chart_setting_version = COMMON_CHART_SETTING_VERSION
+    st.session_state.single_output = None
+    st.session_state.batch_output = None
+    st.session_state.batch_flow = {"stage": "idle", "run_id": 0}
+elif "use_semantic_experience" not in st.session_state:
+    # 兼容手工复用 session_state 但缺失新键的长连接会话。
+    st.session_state.use_semantic_experience = True
 
 PROMPTS_DIR = Path(__file__).parent.parent / "llm" / "prompts"
 
@@ -143,11 +149,21 @@ with st.sidebar:
     st.text(f"并发: {settings.CONCURRENCY_LIMIT}")
     use_common_chart = st.toggle(
         "启用 T0.5 Common Chart",
-        value=False,
         key="use_common_chart",
         help=(
-            "开启时优先使用 common_chart 的高频动作快速匹配；"
-            "关闭时跳过 T0.5，继续使用后续 kNN/LLM 工时分析。"
+            "开启时优先使用当前上传经验文件中 Common_Chart "
+            "的高频动作快速匹配；关闭时跳过 T0.5，继续使用后续"
+            " kNN/LLM 工时分析。"
+        ),
+    )
+    use_semantic_experience = st.toggle(
+        "启用经验语义向量检索",
+        key="use_semantic_experience",
+        help=(
+            "默认开启。用于 Chartcode 经验的语义 Top1 选择"
+            "（阈值 0.70），"
+            "也用于 Common Chart 关键词未命中时的语义回退；"
+            "关闭不会禁用 Common Chart 的关键词匹配。"
         ),
     )
 
@@ -213,6 +229,7 @@ def _build_batch_output_payload(batch_result, run_signature, *, input_count=None
         "manual_review": run_signature[4],
         "experience_digest": run_signature[5],
         "experience_filename": run_signature[6],
+        "use_semantic_experience": run_signature[7],
     }
 
 
@@ -321,12 +338,14 @@ uploaded_file = st.file_uploader(
     ),
 )
 experience_file = st.file_uploader(
-    "上传 STDS 评估经验文件（可选）",
+    "上传 STDS 评估经验文件（启用 Common Chart 时必填）",
     type=["xlsx"],
     key="stds_experience_workbook",
     help=(
-        "支持 STDS评估经验V1.2.xlsx：系统会按“动作经验身份 + Chartcode”"
-        "绑定参数经验；不上传时完全沿用原分析逻辑。"
+        "支持 STDS评估经验V1.2.xlsx 中的 Chartcode 选择、"
+        "参数选择和 Common_Chart 经验。经验语义命中 Chartcode 时"
+        "严格绑定同一条参数经验；Chartcode 由 LLM 选择时，"
+        "系统会汇总该码下全部参数经验，让模型选择一整条后全程沿用。"
     ),
 )
 manual_decomposition_review = st.toggle(
@@ -347,8 +366,12 @@ experience_digest = (
     hashlib.sha256(experience_bytes).hexdigest() if experience_bytes else None
 )
 experience_load_key = (
-    experience_digest,
-    experience_file.name if experience_file is not None else "",
+    (
+        experience_digest,
+        experience_file.name,
+    )
+    if experience_file is not None
+    else None
 )
 if experience_file is None:
     st.session_state.experience_load_key = None
@@ -367,19 +390,55 @@ elif st.session_state.experience_load_key != experience_load_key:
         st.session_state.experience_load_error = str(exc)
     st.session_state.experience_load_key = experience_load_key
 
-if st.session_state.active_experience_digest != experience_digest:
+# 上传经验是一次运行的完整决策上下文。只要文件内容或文件身份
+# 发生变化，旧的单条结果、批量结果与拆解审核状态都不得继续复用。
+if st.session_state.active_experience_key != experience_load_key:
+    previous_run_id = int(st.session_state.batch_flow.get("run_id", 0))
     st.session_state.single_output = None
-    st.session_state.active_experience_digest = experience_digest
+    st.session_state.batch_output = None
+    st.session_state.batch_flow = {
+        "stage": "idle",
+        "run_id": previous_run_id + 1,
+    }
+    st.session_state.active_experience_key = experience_load_key
 
 experience_result = st.session_state.experience_load_result
-experience_index = (
-    experience_result.index
+loaded_experience_index = (
+    getattr(experience_result, "index", None)
     if experience_result is not None
-    and getattr(experience_result.index, "available", False)
+    else None
+)
+common_index = (
+    getattr(experience_result, "common_index", None)
+    if experience_result is not None
+    else None
+)
+if common_index is None and loaded_experience_index is not None:
+    common_index = getattr(loaded_experience_index, "common_index", None)
+chart_experience_records = tuple(
+    getattr(loaded_experience_index, "records", ()) or ()
+)
+parameter_experience_records = tuple(
+    getattr(loaded_experience_index, "parameter_records", ()) or ()
+)
+common_entries = tuple(
+    getattr(experience_result, "common_entries", ()) or ()
+)
+has_valid_experience_context = bool(
+    chart_experience_records
+    or parameter_experience_records
+    or common_entries
+)
+experience_index = (
+    loaded_experience_index
+    if loaded_experience_index is not None
+    and getattr(loaded_experience_index, "available", False)
     else None
 )
 experience_scope = (
-    f"experience:{experience_digest}" if experience_index is not None else ""
+    f"upload:{experience_digest}"
+    if experience_digest and has_valid_experience_context
+    else ""
 )
 experience_fatal = bool(st.session_state.experience_load_error)
 if st.session_state.experience_load_error:
@@ -393,11 +452,30 @@ elif experience_file is not None and experience_result is not None:
         issue for issue in issues
         if str(getattr(issue, "severity", "")).lower() == "error"
     ]
+    core_errors = [
+        issue for issue in errors
+        if str(getattr(issue, "sheet", "")) != "Common_Chart"
+    ]
     warnings = [issue for issue in issues if issue not in errors]
-    experience_fatal = bool(errors) or experience_index is None
-    if experience_index is not None:
+    # Common_Chart 的结构错误只禁用 Common 快速路径；开关关闭时，不能
+    # 连带阻断同一文件里仍然有效的 Chartcode/参数经验。
+    experience_fatal = bool(core_errors) or not has_valid_experience_context
+    if has_valid_experience_context:
+        est_common_count = sum(
+            1
+            for entry in common_entries
+            if getattr(
+                getattr(entry, "kind", ""),
+                "value",
+                getattr(entry, "kind", ""),
+            ) == "fixed_time"
+        )
         st.success(
-            f"经验文件已加载：{len(experience_index.records)} 条有效动作经验，"
+            "经验文件已加载："
+            f"{len(chart_experience_records)} 条有效 Chartcode 选择经验，"
+            f"{len(parameter_experience_records)} 条有效参数选择经验，"
+            f"{len(common_entries)} 条有效 Common_Chart"
+            f"（其中 EST 固定时间 {est_common_count} 条），"
             f"版本 {experience_digest[:10]}。"
         )
     if issues:
@@ -417,6 +495,23 @@ elif experience_file is not None and experience_result is not None:
                 prefix = "❌" if issue in errors else "⚠️"
                 st.write(f"{prefix} {location} {message}".strip())
 
+common_context_missing = use_common_chart and not common_entries
+if common_context_missing:
+    if experience_file is None:
+        st.warning(
+            "已启用 T0.5 Common Chart，请先上传含有效 "
+            "Common_Chart 工作表的 STDS 评估经验文件。"
+            "在完成前，批量和单条分析均已暂停。"
+        )
+    elif not st.session_state.experience_load_error:
+        st.warning(
+            "已启用 T0.5 Common Chart，但当前经验文件中没有"
+            "可用的 Common_Chart 记录。请修复后重新上传，"
+            "或关闭 Common Chart 开关后继续。"
+        )
+
+analysis_blocked = experience_fatal or common_context_missing
+
 batch_run_signature = (
     uploaded_digest,
     uploaded_file.name if uploaded_file is not None else "",
@@ -425,6 +520,7 @@ batch_run_signature = (
     manual_decomposition_review,
     experience_digest or "",
     experience_file.name if experience_file is not None else "",
+    use_semantic_experience,
 )
 review_in_progress = (
     st.session_state.batch_flow.get("stage") == "editing"
@@ -439,11 +535,11 @@ batch_submitted = st.button(
         else "🚀 开始批量分析"
     ),
     type="primary",
-    disabled=uploaded_file is None or review_in_progress or experience_fatal,
+    disabled=uploaded_file is None or review_in_progress or analysis_blocked,
     key="analyze_excel",
 )
 
-if batch_submitted and uploaded_file is not None:
+if batch_submitted and uploaded_file is not None and not analysis_blocked:
     progress_bar = st.progress(0.0)
     progress_text = st.empty()
     decomposition_details = st.empty()
@@ -462,8 +558,10 @@ if batch_submitted and uploaded_file is not None:
         deps = Deps(
             charts=st.session_state.charts,
             cache=st.session_state.cache,
-            common_rows=st.session_state.common_rows,
+            common_entries=common_entries,
+            common_index=common_index,
             use_common_chart=use_common_chart,
+            use_semantic_experience=use_semantic_experience,
             llm_pick_value=pick_value,
             part_weight_index=st.session_state.part_weight_index,
             experience_index=experience_index,
@@ -766,10 +864,11 @@ if (
         confirm_review = review_confirm_col.button(
             "✅ 确认拆解并继续工时分析",
             type="primary",
+            disabled=analysis_blocked,
             key=f"batch_review_confirm_{batch_flow['run_id']}",
         )
 
-        if confirm_review:
+        if confirm_review and not analysis_blocked:
             progress_bar = st.progress(0.5)
             progress_text = st.empty()
             decomposition_details = st.empty()
@@ -785,8 +884,10 @@ if (
                 deps = Deps(
                     charts=st.session_state.charts,
                     cache=st.session_state.cache,
-                    common_rows=st.session_state.common_rows,
+                    common_entries=common_entries,
+                    common_index=common_index,
                     use_common_chart=use_common_chart,
+                    use_semantic_experience=use_semantic_experience,
                     llm_pick_value=pick_value,
                     part_weight_index=st.session_state.part_weight_index,
                     experience_index=experience_index,
@@ -929,6 +1030,10 @@ if (
         f"{'已启用' if batch_output['use_common_chart'] else '已关闭'}"
     )
     st.caption(
+        "本次分析的经验语义向量检索："
+        f"{'已启用' if batch_output['use_semantic_experience'] else '已关闭'}"
+    )
+    st.caption(
         "本次 LLM："
         + (
             f"Ollama / {batch_output['llm_run_signature'][2]}"
@@ -993,15 +1098,25 @@ with st.form("analysis_form"):
         line = st.text_input("项目名称", value="")
         station = st.text_input("工位", value="")
 
-    analyze_submitted = st.form_submit_button("🔍 分析", type="primary")
+    analyze_submitted = st.form_submit_button(
+        "🔍 分析",
+        type="primary",
+        disabled=analysis_blocked,
+    )
 
 if analyze_submitted and not operation.strip():
     st.warning("请输入操作描述")
-if analyze_submitted and experience_fatal:
-    st.error("请先修复或移除无效的 STDS 评估经验文件。")
+if analyze_submitted and analysis_blocked:
+    if common_context_missing:
+        st.error(
+            "Common Chart 已启用，但当前上传上下文中没有"
+            "有效 Common_Chart 记录。"
+        )
+    else:
+        st.error("请先修复或移除无效的 STDS 评估经验文件。")
 
 # ---------- 分析提交 ----------
-if analyze_submitted and operation.strip() and not experience_fatal:
+if analyze_submitted and operation.strip() and not analysis_blocked:
     live_decomposition = st.empty()
     live_progress = st.empty()
     live_details = st.empty()
@@ -1010,7 +1125,6 @@ if analyze_submitted and operation.strip() and not experience_fatal:
     with st.status("正在拆解原始动作…", expanded=True) as single_status:
         charts = st.session_state.charts
         cache = st.session_state.cache
-        common_rows = st.session_state.common_rows
 
         def show_decomposition(split, elapsed_s):
             single_status.update(label="拆解完成，正在逐条进行工时分析…")
@@ -1060,8 +1174,10 @@ if analyze_submitted and operation.strip() and not experience_fatal:
             deps = Deps(
                 charts=charts,
                 cache=cache,
-                common_rows=common_rows,
+                common_entries=common_entries,
+                common_index=common_index,
                 use_common_chart=use_common_chart,
+                use_semantic_experience=use_semantic_experience,
                 llm_pick_value=pick_value,
                 part_weight_index=st.session_state.part_weight_index,
                 experience_index=experience_index,
@@ -1088,6 +1204,7 @@ if analyze_submitted and operation.strip() and not experience_fatal:
             "run_id": st.session_state.single_run_id,
             "analysis": single_analysis,
             "use_common_chart": use_common_chart,
+            "use_semantic_experience": use_semantic_experience,
             "llm_run_signature": llm_run_signature,
             "experience_digest": experience_digest or "",
             "experience_filename": (
@@ -1113,6 +1230,10 @@ if single_output is not None:
     single_analysis: OperationAnalysis = single_output["analysis"]
     single_run_id = single_output["run_id"]
     single_use_common_chart = single_output.get("use_common_chart", False)
+    single_use_semantic_experience = single_output.get(
+        "use_semantic_experience",
+        True,
+    )
     single_llm_signature = single_output.get(
         "llm_run_signature",
         ("configured", "", ""),
@@ -1135,7 +1256,9 @@ if single_output is not None:
         f"拆解阶段 {single_analysis.decompose_elapsed_s:.2f} 秒｜"
         f"工时分析阶段 {single_analysis.analysis_elapsed_s:.2f} 秒｜"
         f"状态：{single_analysis.status}｜T0.5 Common Chart："
-        f"{'已启用' if single_use_common_chart else '已关闭'}｜LLM："
+        f"{'已启用' if single_use_common_chart else '已关闭'}｜"
+        "经验语义向量检索："
+        f"{'已启用' if single_use_semantic_experience else '已关闭'}｜LLM："
         + (
             f"Ollama / {single_llm_signature[2]}"
             if single_llm_signature[0] == "ollama"
@@ -1244,10 +1367,12 @@ if single_output is not None:
                     "history_index": None,
                     "goldens": [],
                     "experience_scope": (
-                        f"experience:{single_output['experience_digest']}"
+                        f"upload:{single_output['experience_digest']}"
                         if single_output.get("experience_digest")
                         else ""
                     ),
+                    "use_common_chart": single_use_common_chart,
+                    "use_semantic_experience": single_use_semantic_experience,
                 })())
                 item.result = edited
                 st.session_state.history.append({

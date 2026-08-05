@@ -105,7 +105,7 @@ def test_resolver_explicit_machine_precedes_experience_and_weight_context():
     class ExperienceIndex:
         available = True
 
-        async def match(self, *_args, **_kwargs):
+        async def match_chartcode_semantic(self, *_args, **_kwargs):
             raise AssertionError("machine action must return before experience")
 
     class WeightIndex:

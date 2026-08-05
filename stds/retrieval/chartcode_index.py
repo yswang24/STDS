@@ -1,4 +1,4 @@
-"""T3:chartcode 向量召回。62 个 chartcode 的标题 embed, top-k + 历史命中投票。"""
+"""T3:普通 chartcode 向量召回；EST 经验专用码不进入通用索引。"""
 from __future__ import annotations
 
 import asyncio
@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import List, Optional
 
+from stds.domain.chartcode_policy import general_chart_candidates
 from stds.retrieval.embed import EmbedBackend, MockEmbed
 
 
@@ -30,8 +31,9 @@ class ChartcodeIndex:
 
     def build(self, charts: dict):
         """从 charts dict 构建索引。"""
-        codes = list(charts.keys())
-        texts = [charts[cc].title or cc for cc in codes]
+        eligible_charts = general_chart_candidates(charts)
+        codes = list(eligible_charts.keys())
+        texts = [eligible_charts[cc].title or cc for cc in codes]
         vecs = self._embed.embed(texts)
         self._chartcodes = list(zip(codes, texts, vecs))
 
