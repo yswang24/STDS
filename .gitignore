@@ -11,6 +11,8 @@ __pycache__/
 # 日志与本地数据库
 *.log
 *.db
+*.db-wal
+*.db-shm
 
 # 系统文件
 .DS_Store
