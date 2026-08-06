@@ -184,6 +184,29 @@ def test_semantic_name_match_is_in_memory_and_short_abbreviation_is_exact_only()
     assert asyncio.run(index.match("BDU")) is None
 
 
+def test_failed_remote_embedding_cannot_create_weight_semantic_match():
+    class _FailedRemote:
+        def __init__(self):
+            self._api_available = None
+
+        def embed(self, texts):
+            self._api_available = False
+            return [[1.0, 0.0] for _ in texts]
+
+        def embed_one(self, _text):
+            return [1.0, 0.0]
+
+    index = PartWeightIndex(
+        [PartWeightRecord("P1", "LOW VOLTAGE CABLE", "低压线束", 0.095)],
+        embed_backend=_FailedRemote(),
+        similarity_threshold=-1.0,
+        similarity_margin=0.0,
+    )
+
+    assert asyncio.run(index.semantic_match("主低压线束")) is None
+    assert index._semantic_unavailable is True
+
+
 def test_llm_extraction_ignores_quantity_and_rejects_hallucination(monkeypatch):
     calls = []
 

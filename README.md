@@ -561,14 +561,20 @@ EST 固定时间：上传时间 / 源频率 × 输入记录显式频率（只乘
 | `PART_WEIGHT_XLSX_PATH` | 零件重量表路径 |
 | `PART_WEIGHT_SIMILARITY_THRESHOLD` | 重量语义匹配阈值，默认 0.85 |
 | `PART_WEIGHT_SIMILARITY_MARGIN` | 重量语义第一名优势，默认 0.05 |
-| `LLM_BACKEND` | `auto`、`vllm`、`deepseek`、`custom`、`ollama` 或 `mock` |
-| `EMBED_BACKEND` | 独立向量后端：`auto`、`vllm`、`custom`、`ollama` 或 `mock` |
+| `LLM_BACKEND` | `auto`、`vllm`、`deepseek`、`ark`、`custom`、`ollama` 或 `mock` |
+| `EMBED_BACKEND` | 独立向量后端：`auto`、`vllm`、`ark`、`custom`、`ollama` 或 `mock` |
 | `VLLM_EMBED_BASE_URL` | 可选的独立 vLLM embedding `/v1` 地址 |
 | `VLLM_EMBED_MODEL` | vLLM embedding 模型名 |
 | `EMBED_MODEL` | Ollama embedding 模型名 |
 | `DEEPSEEK_API_BASE_URL` | DeepSeek OpenAI 兼容接口，默认 `https://api.deepseek.com` |
 | `DEEPSEEK_API_KEY` | DeepSeek API Key |
 | `DEEPSEEK_LLM_MODEL` | DeepSeek 模型，默认 `deepseek-v4-flash` |
+| `ARK_API_BASE_URL` | 火山引擎方舟推理地址，默认北京区域 `/api/v3` |
+| `ARK_API_KEY` | 方舟推理使用的单一 Bearer API Key |
+| `ARK_LLM_MODEL` | 方舟聊天 Model ID 或 `ep-...` Endpoint ID |
+| `ARK_EMBED_API_KEY` | 可选的独立向量 Key；留空时复用 `ARK_API_KEY` |
+| `ARK_EMBED_MODEL` | 方舟向量 Model ID 或 Endpoint ID |
+| `ARK_EMBED_MODE` | `text`（标准文本向量）或 `multimodal`（视觉向量接口） |
 | `CONCURRENCY_LIMIT` | 批量并发数 |
 
 DeepSeek 配置示例：
@@ -585,6 +591,44 @@ DeepSeek 后端使用 OpenAI 兼容的 `/chat/completions` 和 JSON Output。Dee
 提供。`EMBED_BACKEND` 与 `LLM_BACKEND` 相互独立，例如可同时使用
 `LLM_BACKEND=deepseek` 和 `EMBED_BACKEND=ollama`；Mock 仅用于确定性降级，
 不会产生业务语义命中。
+
+### 火山引擎方舟
+
+方舟聊天使用 OpenAI 兼容的 `POST /chat/completions`。所有现有 LLM 任务——动作
+拆分、零件提取、Chartcode 选择和参数选择——都通过统一客户端调用，因此只需切换
+后端配置：
+
+```dotenv
+LLM_BACKEND=ark
+ARK_API_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+ARK_API_KEY=请填写轮换后的单一方舟APIKey
+ARK_LLM_MODEL=请填写Model-ID或ep-Endpoint-ID
+```
+
+`AccessKeyId / SecretAccessKey` 属于火山 OpenAPI 管理面签名凭证，不能直接拼接或
+传给推理客户端。运行时只读取一个 `ARK_API_KEY`，密钥不进入 UI、API Job 请求、
+数据库或日志。聊天请求默认不发送并非所有方舟模型都承诺支持的
+`response_format`；现有 JSON Schema 提示词、JSON 解析和 Pydantic 校验继续保证结构。
+
+语义检索可以独立切到方舟。标准文本向量接口会自动按 256 条分批，并保持原始顺序：
+
+```dotenv
+EMBED_BACKEND=ark
+ARK_EMBED_MODEL=请填写文本向量Model-ID或Endpoint-ID
+ARK_EMBED_MODE=text
+```
+
+如果使用 Doubao 视觉向量模型，则改为 `ARK_EMBED_MODE=multimodal`，项目会调用
+`/embeddings/multimodal` 并按其专用输入格式逐条处理纯文本。任意一批远端向量失败
+时，整批结果会被标记为不可用于语义决策；Chartcode、Common Chart、参数经验和零件
+重量都不会把降级 Mock 向量当成真实匹配。
+
+真实联网冒烟测试默认跳过，避免普通测试产生费用。确认已使用轮换后的 Key 并配置
+模型/Endpoint 后，可显式执行：
+
+```bash
+RUN_ARK_SMOKE=1 .venv/bin/python -m pytest -q tests/live/test_ark_smoke.py
+```
 
 启动 Streamlit：
 

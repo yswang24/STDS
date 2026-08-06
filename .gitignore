@@ -1,7 +1,8 @@
 # 环境与依赖
 .venv/
 venv/
-.env
+.env*
+!.env.example
 
 # Python 缓存
 __pycache__/

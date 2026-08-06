@@ -280,10 +280,14 @@ def test_semantic_experience_toggle_off_forces_llm_chartcode_selection():
         selector_calls.append(operation_des)
         return "202 010"
 
+    async def pick_first(_operation_des, _candidates):
+        return _candidates[0], 1.0, "test"
+
     deps = Deps(
         charts=charts,
         cache=AutoCache(),
         llm_select_chartcode=select_chartcode,
+        llm_pick_value=pick_first,
         experience_index=ExperienceIndex(
             [chart_entry],
             embed_backend=_AlignedEmbed(),
@@ -329,11 +333,15 @@ def test_lexical_only_experience_api_cannot_select_chartcode():
         selector_calls.append(operation_des)
         return "202 010"
 
+    async def pick_first(_operation_des, _candidates):
+        return _candidates[0], 1.0, "test"
+
     deps = Deps(
         charts=charts,
         cache=AutoCache(),
         experience_index=LexicalOnlyIndex(),
         llm_select_chartcode=select_chartcode,
+        llm_pick_value=pick_first,
     )
 
     result = asyncio.run(

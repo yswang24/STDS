@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -25,11 +25,14 @@ class Settings:
     DB_PATH: str = os.environ.get(
         "DB_PATH", str(Path(__file__).resolve().parents[2] / "stms.db")
     )
-    # LLM 后端:auto / vllm / deepseek / custom / ollama / mock
+    # LLM 后端:auto / vllm / deepseek / ark / custom / ollama / mock
     LLM_BACKEND: str = os.environ.get("LLM_BACKEND", "auto")
     # vLLM(OpenAI 兼容)
     VLLM_BASE_URL: str = os.environ.get("VLLM_BASE_URL", "http://localhost:8000/v1")
-    VLLM_API_KEY: str = os.environ.get("VLLM_API_KEY", "EMPTY")
+    VLLM_API_KEY: str = field(
+        default=os.environ.get("VLLM_API_KEY", "EMPTY"),
+        repr=False,
+    )
     VLLM_LLM_MODEL: str = os.environ.get("VLLM_LLM_MODEL", "qwen3-14b")
     # Embedding 端点:默认留空 → 回退到 VLLM_BASE_URL(对话共用);
     # 若有独立 embedding 服务(如 8001)则填其 /v1 地址
@@ -42,14 +45,38 @@ class Settings:
         "DEEPSEEK_API_BASE_URL",
         os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
     )
-    DEEPSEEK_API_KEY: str = os.environ.get("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_API_KEY: str = field(
+        default=os.environ.get("DEEPSEEK_API_KEY", ""),
+        repr=False,
+    )
     DEEPSEEK_LLM_MODEL: str = os.environ.get(
         "DEEPSEEK_LLM_MODEL",
         "deepseek-v4-flash",
     )
+    # 火山引擎方舟(OpenAI 兼容 API)。model 可填模型 ID 或推理接入点 ID。
+    ARK_API_BASE_URL: str = os.environ.get(
+        "ARK_API_BASE_URL",
+        "https://ark.cn-beijing.volces.com/api/v3",
+    )
+    ARK_API_KEY: str = field(
+        default=os.environ.get("ARK_API_KEY", ""),
+        repr=False,
+    )
+    ARK_LLM_MODEL: str = os.environ.get("ARK_LLM_MODEL", "")
+    # 文本语义检索可使用标准 /embeddings，或为新视觉向量模型选择
+    # multimodal 模式（/embeddings/multimodal）。
+    ARK_EMBED_MODEL: str = os.environ.get("ARK_EMBED_MODEL", "")
+    ARK_EMBED_MODE: str = os.environ.get("ARK_EMBED_MODE", "text")
+    ARK_EMBED_API_KEY: str = field(
+        default=os.environ.get("ARK_EMBED_API_KEY", ""),
+        repr=False,
+    )
     # 自定义 API(任意 OpenAI 兼容端点,如 DeepSeek / 智谱 / 自部署)
     CUSTOM_API_BASE_URL: str = os.environ.get("CUSTOM_API_BASE_URL", "http://localhost:9000/v1")
-    CUSTOM_API_KEY: str = os.environ.get("CUSTOM_API_KEY", "")
+    CUSTOM_API_KEY: str = field(
+        default=os.environ.get("CUSTOM_API_KEY", ""),
+        repr=False,
+    )
     CUSTOM_LLM_MODEL: str = os.environ.get("CUSTOM_LLM_MODEL", "mimo-v2.5-pro")
     CUSTOM_EMBED_MODEL: str = os.environ.get("CUSTOM_EMBED_MODEL", "")
     CUSTOM_API_EXTRA_HEADERS: str = os.environ.get("CUSTOM_API_EXTRA_HEADERS", "")  # JSON 格式

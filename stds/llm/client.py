@@ -1,6 +1,6 @@
-"""LLM 结构化输出封装。后端:auto / vllm / deepseek / custom / ollama / mock。
+"""LLM 结构化输出封装。后端:auto / vllm / deepseek / ark / custom / ollama / mock。
 
-vllm、deepseek 和 custom 都是 OpenAI 兼容 API，只是配置不同。
+vllm、deepseek、ark 和 custom 都是 OpenAI 兼容 API，只是配置不同。
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ class LLMError(Exception):
 
 
 SUPPORTED_LLM_BACKENDS = frozenset(
-    {"auto", "vllm", "deepseek", "custom", "ollama", "mock"}
+    {"auto", "vllm", "deepseek", "ark", "custom", "ollama", "mock"}
 )
 OLLAMA_SYSTEM_EXECUTION_PROMPT = (
     "请严格执行 system 中的任务，并且只输出符合指定 JSON Schema 的 JSON。"
@@ -103,6 +103,28 @@ def _schema_name(schema: Type[BaseModel]) -> str:
     return (name or "structured_output")[:64]
 
 
+def _redact_sensitive_text(value: Any) -> str:
+    """避免上游错误回显或异常文本把已配置凭证带入日志/API。"""
+    text = str(value)
+    configured = {
+        settings.VLLM_API_KEY,
+        settings.DEEPSEEK_API_KEY,
+        settings.ARK_API_KEY,
+        settings.ARK_EMBED_API_KEY,
+        settings.CUSTOM_API_KEY,
+    }
+    for secret in configured:
+        secret = str(secret or "").strip()
+        if len(secret) >= 6 and secret.upper() != "EMPTY":
+            text = text.replace(secret, "[REDACTED]")
+    text = re.sub(
+        r"(?i)(bearer\s+)[^\s,;\"']+",
+        r"\1[REDACTED]",
+        text,
+    )
+    return text
+
+
 def _response_error_message(status_code: int, data: Any) -> str:
     message = ""
     code = ""
@@ -121,7 +143,7 @@ def _response_error_message(status_code: int, data: Any) -> str:
         keys = type(data).__name__
     suffix = f" code={code}" if code else ""
     detail = message[:1000] if message else f"response keys={keys}"
-    return f"HTTP {status_code}{suffix}: {detail}"
+    return _redact_sensitive_text(f"HTTP {status_code}{suffix}: {detail}")
 
 
 def _json_from_content(content: Any) -> Any:
@@ -163,7 +185,9 @@ def _parse_chat_response(response) -> Any:
     try:
         data = response.json()
     except Exception as exc:
-        body = str(getattr(response, "text", ""))[:1000]
+        body = _redact_sensitive_text(
+            str(getattr(response, "text", ""))[:1000]
+        )
         raise _LLMResponseError(
             status_code,
             f"HTTP {status_code}: 非 JSON 响应 {body!r}",
@@ -196,7 +220,10 @@ def _parse_chat_response(response) -> Any:
         content = choice.get("text")
     if content is None:
         raise _LLMResponseError(status_code, "choices[0] 中没有 message.content")
-    logger.debug("[LLM] response: %s", str(content)[:300])
+    logger.debug(
+        "[LLM] response: %s",
+        _redact_sensitive_text(str(content)[:300]),
+    )
     return _json_from_content(content)
 
 
@@ -258,6 +285,7 @@ class _OpenAIClient:
         *,
         vllm_json_schema: bool = False,
         json_keyword_required: bool = False,
+        supports_json_response_format: bool = True,
     ):
         self.base = base_url.rstrip("/")
         self.api_key = api_key
@@ -265,6 +293,7 @@ class _OpenAIClient:
         self.extra_headers = extra_headers or {}
         self.vllm_json_schema = vllm_json_schema
         self.json_keyword_required = json_keyword_required
+        self.supports_json_response_format = supports_json_response_format
 
     def _request_payload(
         self,
@@ -320,7 +349,7 @@ class _OpenAIClient:
                 {"role": "user", "content": full_prompt},
             ]
         headers = {"Authorization": f"Bearer {self.api_key}", **self.extra_headers}
-        use_json_response_format = not (
+        use_json_response_format = self.supports_json_response_format and not (
             self.json_keyword_required and "json" not in full_prompt.lower()
         )
         if not use_json_response_format:
@@ -328,7 +357,10 @@ class _OpenAIClient:
                 "[LLM] prompt 不含 JSON 关键字，按服务约束省略 response_format"
             )
         logger.debug(f"[LLM] model={model} backend={self.base}")
-        logger.debug(f"[LLM] prompt:\n{full_prompt[:500]}...")
+        logger.debug(
+            "[LLM] prompt:\n%s...",
+            _redact_sensitive_text(full_prompt[:500]),
+        )
         retry_count = 0
         legacy_vllm = False
         while True:
@@ -369,7 +401,10 @@ class _OpenAIClient:
                 ):
                     await asyncio.sleep(min(2 ** retry_count, 4))
                 retry_count += 1
-        raise LLMError(f"OpenAI 兼容 API 结构化失败(重试{retries}次): {last}")
+        message = _redact_sensitive_text(last)
+        raise LLMError(
+            f"OpenAI 兼容 API 结构化失败(重试{retries}次): {message}"
+        )
 
 
 # ---------- Ollama ----------
@@ -462,6 +497,10 @@ def _detect_backend():
             return "vllm"
     except Exception:
         pass
+    # 方舟运行时接口不依赖 GET /models。配置完整时即可选中，
+    # 真实鉴权与模型可用性由首次 chat/completions 请求校验。
+    if settings.ARK_API_KEY.strip() and settings.ARK_LLM_MODEL.strip():
+        return "ark"
     # DeepSeek
     if settings.DEEPSEEK_API_KEY:
         try:
@@ -541,6 +580,24 @@ def _make_client(backend: str):
             settings.DEEPSEEK_API_KEY,
             settings.DEEPSEEK_LLM_MODEL,
             json_keyword_required=True,
+        )
+    elif backend == "ark":
+        if not settings.ARK_API_KEY.strip():
+            raise LLMError(
+                "火山引擎方舟 API Key 未配置，请设置环境变量 ARK_API_KEY"
+            )
+        ark_model = runtime.model or settings.ARK_LLM_MODEL
+        if not ark_model.strip():
+            raise LLMError(
+                "火山引擎方舟模型未配置，请设置环境变量 ARK_LLM_MODEL"
+            )
+        return _OpenAIClient(
+            settings.ARK_API_BASE_URL,
+            settings.ARK_API_KEY,
+            ark_model,
+            # 方舟通用 Chat 参数文档未承诺所有模型都支持
+            # response_format；Schema 提示词与 Pydantic 校验仍会约束输出。
+            supports_json_response_format=False,
         )
     elif backend == "custom":
         return _OpenAIClient(

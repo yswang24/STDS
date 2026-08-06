@@ -19,7 +19,7 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
 from stds.config.settings import settings
-from stds.retrieval.embed import EmbedBackend, get_embed_backend
+from stds.retrieval.embed import EmbedBackend, MockEmbed, get_embed_backend
 
 logger = logging.getLogger("stds.part_weight")
 
@@ -198,6 +198,34 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _semantic_backend_available(backend: Optional[EmbedBackend]) -> bool:
+    if backend is None or isinstance(backend, MockEmbed):
+        return False
+    semantic_available = getattr(backend, "semantic_available", None)
+    if semantic_available is not None:
+        return bool(semantic_available)
+    return getattr(backend, "_api_available", None) is not False
+
+
+def _valid_vectors(vectors: object, expected: int) -> bool:
+    if not isinstance(vectors, (list, tuple)) or len(vectors) != expected:
+        return False
+    dimension: Optional[int] = None
+    for vector in vectors:
+        if not isinstance(vector, (list, tuple)) or not vector:
+            return False
+        if dimension is None:
+            dimension = len(vector)
+        elif len(vector) != dimension:
+            return False
+        try:
+            if not all(math.isfinite(float(value)) for value in vector):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 class PartWeightIndex:
     def __init__(
         self,
@@ -229,6 +257,7 @@ class PartWeightIndex:
             if normalize_part_name(name)
         ]
         self._semantic_vectors: Optional[list[list[float]]] = None
+        self._semantic_unavailable = False
         self._build_lock: Optional[asyncio.Lock] = None
 
     @classmethod
@@ -304,22 +333,44 @@ class PartWeightIndex:
             matched_name=matched_name,
         )
 
-    async def _ensure_semantic_vectors(self) -> None:
+    async def _ensure_semantic_vectors(self) -> bool:
         if self._semantic_vectors is not None:
-            return
+            return True
+        if self._semantic_unavailable:
+            return False
         if self._build_lock is None:
             self._build_lock = asyncio.Lock()
         async with self._build_lock:
             if self._semantic_vectors is not None:
-                return
-            if self._embed is None:
-                self._embed = self._embed_backend_factory()
-            texts = [name for _, name in self._semantic_entries]
-            self._semantic_vectors = (
-                await asyncio.to_thread(self._embed.embed, texts)
-                if texts
-                else []
-            )
+                return True
+            if self._semantic_unavailable:
+                return False
+            try:
+                if self._embed is None:
+                    self._embed = self._embed_backend_factory()
+                if not _semantic_backend_available(self._embed):
+                    self._semantic_unavailable = True
+                    return False
+                texts = [name for _, name in self._semantic_entries]
+                vectors = (
+                    await asyncio.to_thread(self._embed.embed, texts)
+                    if texts
+                    else []
+                )
+                if (
+                    not _semantic_backend_available(self._embed)
+                    or not _valid_vectors(vectors, len(texts))
+                ):
+                    self._semantic_unavailable = True
+                    return False
+                self._semantic_vectors = [
+                    [float(value) for value in vector]
+                    for vector in vectors
+                ]
+                return True
+            except Exception:
+                self._semantic_unavailable = True
+                return False
 
     async def semantic_match(
         self,
@@ -334,10 +385,22 @@ class PartWeightIndex:
         if re.fullmatch(r"[a-z0-9]{1,4}", normalized):
             return None
 
-        await self._ensure_semantic_vectors()
+        if not await self._ensure_semantic_vectors():
+            return None
         if self._embed is None or not self._semantic_vectors:
             return None
-        query_vector = await asyncio.to_thread(self._embed.embed_one, query)
+        try:
+            query_vector = await asyncio.to_thread(self._embed.embed_one, query)
+        except Exception:
+            self._semantic_unavailable = True
+            return None
+        if (
+            not _semantic_backend_available(self._embed)
+            or not _valid_vectors([query_vector], 1)
+            or len(query_vector) != len(self._semantic_vectors[0])
+        ):
+            self._semantic_unavailable = True
+            return None
         scored = sorted(
             (
                 (_cosine(query_vector, vector), record, name)

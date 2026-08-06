@@ -173,7 +173,7 @@ class JobRequest(BaseModel):
     use_semantic_experience: bool = True
     experience_context_id: Optional[str] = None
     llm_backend: Optional[
-        Literal["auto", "vllm", "deepseek", "custom", "ollama", "mock"]
+        Literal["auto", "vllm", "deepseek", "ark", "custom", "ollama", "mock"]
     ] = None
     llm_model: Optional[str] = None
     ollama_base_url: Optional[str] = None

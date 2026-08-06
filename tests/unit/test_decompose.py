@@ -291,6 +291,111 @@ def test_deepseek_client_requires_api_key(monkeypatch):
         _make_client("deepseek")
 
 
+def test_ark_client_uses_official_openai_compatible_contract(monkeypatch):
+    captured = {}
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": '{"operation":["操作人员拿取零件"]}'}}
+                ]
+            }
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["headers"] = kwargs["headers"]
+        captured["payload"] = kwargs["json"]
+        return Response()
+
+    monkeypatch.setattr(
+        "stds.llm.client.settings.ARK_API_BASE_URL",
+        "https://ark.cn-beijing.volces.com/api/v3/",
+    )
+    monkeypatch.setattr("stds.llm.client.settings.ARK_API_KEY", "ark-test-key")
+    monkeypatch.setattr("stds.llm.client.settings.ARK_LLM_MODEL", "ep-test")
+    monkeypatch.setattr("stds.llm.client.httpx.post", fake_post)
+
+    result = asyncio.run(
+        _make_client("ark").structured("请用 JSON 拆解", DecomposeOut, retries=0)
+    )
+
+    assert result.operation == ["操作人员拿取零件"]
+    assert captured["url"] == (
+        "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+    )
+    assert captured["headers"]["Authorization"] == "Bearer ark-test-key"
+    assert captured["payload"]["model"] == "ep-test"
+    assert "response_format" not in captured["payload"]
+    assert captured["payload"]["stream"] is False
+
+
+def test_ark_client_requires_api_key(monkeypatch):
+    monkeypatch.setattr("stds.llm.client.settings.ARK_API_KEY", "")
+    monkeypatch.setattr("stds.llm.client.settings.ARK_LLM_MODEL", "ep-test")
+
+    with pytest.raises(LLMError, match="ARK_API_KEY"):
+        _make_client("ark")
+
+
+def test_ark_client_requires_model(monkeypatch):
+    monkeypatch.setattr("stds.llm.client.settings.ARK_API_KEY", "ark-test-key")
+    monkeypatch.setattr("stds.llm.client.settings.ARK_LLM_MODEL", "")
+
+    with pytest.raises(LLMError, match="ARK_LLM_MODEL"):
+        _make_client("ark")
+
+
+def test_auto_detection_uses_configured_ark_without_models_probe(monkeypatch):
+    requested_urls = []
+
+    class Response:
+        status_code = 404
+
+    def fake_get(url, **kwargs):
+        requested_urls.append(url)
+        return Response()
+
+    monkeypatch.setattr("stds.llm.client.settings.ARK_API_KEY", "ark-test-key")
+    monkeypatch.setattr("stds.llm.client.settings.ARK_LLM_MODEL", "ep-test")
+    monkeypatch.setattr("stds.llm.client.httpx.get", fake_get)
+
+    assert _detect_backend() == "ark"
+    assert requested_urls == [f"{settings.VLLM_BASE_URL}/models"]
+
+
+def test_ark_server_error_cannot_echo_configured_api_key(monkeypatch):
+    sentinel = "ark-sensitive-sentinel-key"
+
+    class Response:
+        status_code = 401
+
+        def json(self):
+            return {
+                "error": {
+                    "code": "Unauthorized",
+                    "message": f"invalid bearer {sentinel}",
+                }
+            }
+
+    monkeypatch.setattr("stds.llm.client.settings.ARK_API_KEY", sentinel)
+    monkeypatch.setattr("stds.llm.client.settings.ARK_LLM_MODEL", "ep-test")
+    monkeypatch.setattr(
+        "stds.llm.client.httpx.post",
+        lambda *args, **kwargs: Response(),
+    )
+
+    with pytest.raises(LLMError) as exc_info:
+        asyncio.run(
+            _make_client("ark").structured("输出 JSON", DecomposeOut, retries=0)
+        )
+
+    assert sentinel not in str(exc_info.value)
+    assert "[REDACTED]" in str(exc_info.value)
+
+
 def test_openai_error_response_reports_real_service_message(monkeypatch):
     class Response:
         status_code = 429
