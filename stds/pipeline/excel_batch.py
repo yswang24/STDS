@@ -27,6 +27,7 @@ from stds.cascade.resolver import (
 )
 from stds.cascade.rules import normalize
 from stds.config.settings import settings
+from stds.domain.chartcode_policy import is_experience_only_chartcode
 from stds.domain.models import Source, StdsElement, StdsResult
 from stds.llm.decompose import decompose_operation
 from stds.llm.translate_operation import (
@@ -771,6 +772,20 @@ def _result_records(rows: list[ExcelRowResult]) -> list[list]:
     return [detail.output_values() for row in rows for detail in row.details]
 
 
+def _xlsx_result_records(rows: list[ExcelRowResult]) -> list[list]:
+    """生成 XLSX 专用记录；EST 固定时间不展示 Decisions 决策串。"""
+    records: list[list] = []
+    decision_index = OUTPUT_HEADERS.index(DECISION_HEADER)
+    chartcode_index = OUTPUT_HEADERS.index(CHARTCODE_HEADER)
+    for row in rows:
+        for detail in row.details:
+            values = detail.output_values()
+            if is_experience_only_chartcode(values[chartcode_index]):
+                values[decision_index] = None
+            records.append(values)
+    return records
+
+
 def _export_text(header: str, value: object) -> str:
     if value is None:
         return ""
@@ -828,7 +843,7 @@ def _write_decomposition(
 
 def _write_results(workbook, rows: list[ExcelRowResult]) -> tuple[bytes, str]:
     """生成 3.STDS-工时生成.xlsx 的 A:O，原模板后三列不创建。"""
-    records = _result_records(rows)
+    records = _xlsx_result_records(rows)
     return _write_records(
         workbook,
         OUTPUT_HEADERS,

@@ -152,7 +152,8 @@ with st.sidebar:
         key="use_common_chart",
         help=(
             "开启时优先使用当前上传经验文件中 Common_Chart "
-            "的高频动作快速匹配；关闭时跳过 T0.5，继续使用后续"
+            "的高频动作快速匹配；默认语义 Top1@0.70 优先，低分或"
+            "向量不可用时回退关键词。关闭时跳过 T0.5，继续使用后续"
             " kNN/LLM 工时分析。"
         ),
     )
@@ -162,8 +163,8 @@ with st.sidebar:
         help=(
             "默认开启。用于 Chartcode 经验的语义 Top1 选择"
             "（阈值 0.70），"
-            "也用于 Common Chart 关键词未命中时的语义回退；"
-            "关闭不会禁用 Common Chart 的关键词匹配。"
+            "也用于 Common Chart 的语义 Top1 优先匹配；"
+            "关闭或向量不可用时，Common Chart 回退关键词匹配。"
         ),
     )
 
@@ -994,7 +995,8 @@ if (
         "拆解文件为原七列 PF 格式加“翻译后作业描述”；"
         "工时结果为 A:O 十五列，STDS描述仅展示翻译结果，"
         "并在最后一列给出决策链选择原因。"
-        "同一组 CSV/XLSX 按钮使用完全相同的行、列和顺序。"
+        "CSV/XLSX 使用相同的行、列和顺序；EST C00/V00 仅在 XLSX 中"
+        "将 Decisions 留空，Time(s) 仍正常输出，CSV 与页面预览保留内部决策值。"
     )
 
     with st.expander("📋 工时结果预览（A:O 十五列）", expanded=True):

@@ -43,7 +43,7 @@ class Deps:
     charts: dict                           # {chartcode: MostChart}
     cache: object                          # AutoCache
     common_entries: Sequence = ()          # 上传经验文件中的 Common_Chart
-    common_index: object = None             # Common 关键词优先、语义回退索引
+    common_index: object = None             # Common 语义优先、关键词回退索引
     common_rows: Optional[Sequence] = None # 兼容显式注入的旧参数名；不再读数据库
     use_common_chart: bool = False          # 是否启用 T0.5 快速路径（默认关闭）
     use_semantic_experience: bool = True    # Chartcode/Common 语义检索（默认开启）

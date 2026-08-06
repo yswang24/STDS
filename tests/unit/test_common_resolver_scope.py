@@ -120,7 +120,7 @@ def test_common_semantic_top1_is_used_by_resolver_and_audited():
     assert backend.embed_calls == 1
 
 
-def test_common_semantic_toggle_off_keeps_keywords_but_skips_vector_fallback():
+def test_common_semantic_toggle_off_uses_keyword_fallback_without_vector():
     entry = _fixed_common("托盘落位", time_s=6)
     backend = _CommonSemanticEmbed(1.0)
 

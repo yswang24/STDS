@@ -748,6 +748,59 @@ def test_pf_input_is_flattened_to_independent_decomposition_and_final_files():
     assert [row["STDS描述"] for row in detail_rows] == child_operations
 
 
+@pytest.mark.parametrize(
+    ("chartcode", "cv"),
+    [("EST C00", "C"), ("EST V00", "V")],
+)
+def test_est_fixed_time_hides_only_xlsx_decision(chartcode, cv):
+    trace = [("FIXED_TIME", "5.00 s", "上传经验指定固定工时")]
+
+    async def fake_resolver(element, deps, *, machine_hint=None):
+        assert machine_hint is False
+        return StdsResult(
+            element=element,
+            chartcode=chartcode,
+            decision="5S",
+            time_s=5.0,
+            cv=cv,
+            freq=1.0,
+            source=Source.FORMULA,
+            confidence=1.0,
+            needs_review=False,
+            trace=list(trace),
+        )
+
+    batch = asyncio.run(
+        _analyze_excel_bytes(
+            _workbook_bytes(),
+            "1.STDS-PF清单.xlsx",
+            object(),
+            resolver=fake_resolver,
+        )
+    )
+
+    detail = batch.rows[0].details[0]
+    assert detail.result is not None
+    assert detail.result.decision == "5S"
+    assert detail.result.time_s == 5.0
+    assert detail.result.trace == trace
+
+    final_ws = _sheet(batch.output_bytes)
+    assert final_ws.cell(2, 10).value is None
+    assert final_ws.cell(2, 11).value == chartcode
+    assert final_ws.cell(2, 12).value == cv
+    assert final_ws.cell(2, 14).value == 5.0
+    assert _trace_steps(final_ws.cell(2, 15).value)[0]["变量"] == "FIXED_TIME"
+
+    preview_reason = batch.detail_preview_rows()[0]["决策链选择的原因"]
+    assert _trace_steps(preview_reason)[0]["变量"] == "FIXED_TIME"
+    csv_row = _csv_rows(batch.output_csv_bytes)[1]
+    assert csv_row[9] == "5S"
+    assert csv_row[10] == chartcode
+    assert csv_row[13] == "5.00"
+    assert _trace_steps(csv_row[14])[0]["变量"] == "FIXED_TIME"
+
+
 def test_global_sequence_is_rebuilt_and_duplicate_operations_are_analyzed_once():
     resolver_calls = 0
     progress = []

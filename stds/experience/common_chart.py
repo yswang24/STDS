@@ -42,8 +42,8 @@ def _match_common_chart_keywords(
 ) -> tuple[Optional[CommonChartMatch], bool]:
     """返回关键词结果和“是否出现过词法候选”。
 
-    第二个返回值用于语义回退：只要精确或包含层出现过候选，即使该层
-    因输出冲突而歧义，也必须停止 Common 匹配，不能让语义分数覆盖歧义。
+    第二个返回值用于区分“没有候选”和“候选输出冲突”；整体索引只有在
+    语义 Top1 未达阈值时才调用本关键词回退器。
     """
     normalized_input = normalize_operation(operation_des)
     if not normalized_input:

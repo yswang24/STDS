@@ -72,9 +72,13 @@ def test_semantic_document_contains_operation_and_only_valid_keywords():
     assert "拿" not in document.split("关键词：", 1)[1]
 
 
-def test_keyword_match_does_not_construct_or_call_embedding():
+def test_keyword_match_falls_back_when_embedding_is_unavailable():
+    factory_calls = 0
+
     def unavailable_factory():
-        raise AssertionError("keyword matching must not initialize embedding")
+        nonlocal factory_calls
+        factory_calls += 1
+        raise RuntimeError("embedding unavailable")
 
     index = CommonChartSemanticIndex(
         [_entry(2, "转身", keywords=("转身",))],
@@ -86,10 +90,11 @@ def test_keyword_match_does_not_construct_or_call_embedding():
     assert match is not None
     assert match.match_type == "contains"
     assert match.entry.row == 2
+    assert factory_calls == 1
 
 
-def test_keyword_ambiguity_stops_common_without_semantic_override():
-    backend = _SemanticEmbed([[1.0, 0.0], [1.0, 0.0]], [1.0, 0.0])
+def test_semantic_hit_overrides_keyword_ambiguity():
+    backend = _SemanticEmbed([[0.0, 1.0], [1.0, 0.0]], [1.0, 0.0])
     index = CommonChartSemanticIndex(
         [
             _entry(2, "扫描一", keywords=("扫描",), time_s=1.0),
@@ -98,12 +103,95 @@ def test_keyword_ambiguity_stops_common_without_semantic_override():
         embed_backend=backend,
     )
 
-    assert asyncio.run(index.match("人工A扫描")) is None
-    assert backend.embed_calls == 0
-    assert backend.embed_one_calls == 0
+    match = asyncio.run(index.match("人工A扫描"))
+
+    assert match is not None
+    assert match.match_type == "semantic"
+    assert match.entry.row == 3
+    assert backend.embed_calls == 1
+    assert backend.embed_one_calls == 1
 
 
-def test_semantic_fallback_uses_threshold_070_and_top1_without_margin():
+def test_semantic_hit_overrides_unambiguous_keyword_match():
+    backend = _SemanticEmbed([[0.0, 1.0], [1.0, 0.0]], [1.0, 0.0])
+    index = CommonChartSemanticIndex(
+        [
+            _entry(2, "扫描", keywords=("扫描",)),
+            _entry(3, "检查", keywords=("检查",)),
+        ],
+        embed_backend=backend,
+    )
+
+    match = asyncio.run(index.match("人工A扫描"))
+
+    assert match is not None
+    assert match.match_type == "semantic"
+    assert match.entry.row == 3
+
+
+def test_semantic_low_score_falls_back_to_keyword_and_keeps_ambiguity():
+    keyword_backend = _SemanticEmbed([[0.1, 0.995]], [1.0, 0.0])
+    keyword_index = CommonChartSemanticIndex(
+        [_entry(2, "转身", keywords=("转身",))],
+        embed_backend=keyword_backend,
+    )
+
+    keyword_match = asyncio.run(keyword_index.match("人工A转身"))
+
+    assert keyword_match is not None
+    assert keyword_match.match_type == "contains"
+    assert keyword_match.entry.row == 2
+
+    ambiguous_backend = _SemanticEmbed(
+        [[0.1, 0.995], [0.2, 0.98]],
+        [1.0, 0.0],
+    )
+    ambiguous_index = CommonChartSemanticIndex(
+        [
+            _entry(2, "扫描一", keywords=("扫描",), time_s=1.0),
+            _entry(3, "扫描二", keywords=("扫描",), time_s=2.0),
+        ],
+        embed_backend=ambiguous_backend,
+    )
+
+    assert asyncio.run(ambiguous_index.match("人工A扫描")) is None
+
+
+def test_invalid_or_failed_semantic_query_falls_back_to_keyword():
+    class _InvalidDocuments(_SemanticEmbed):
+        def embed(self, texts):
+            self.embed_calls += 1
+            return [[float("nan"), 0.0] for _ in texts]
+
+    class _InvalidQuery(_SemanticEmbed):
+        def embed_one(self, _text):
+            self.embed_one_calls += 1
+            return [float("nan"), 0.0]
+
+    class _FailedQuery(_SemanticEmbed):
+        def embed_one(self, _text):
+            self.embed_one_calls += 1
+            raise RuntimeError("query failed")
+
+    backends = (
+        _InvalidDocuments([[1.0, 0.0]], [1.0, 0.0]),
+        _InvalidQuery([[1.0, 0.0]], [1.0, 0.0]),
+        _FailedQuery([[1.0, 0.0]], [1.0, 0.0]),
+    )
+    for backend in backends:
+        index = CommonChartSemanticIndex(
+            [_entry(2, "转身", keywords=("转身",))],
+            embed_backend=backend,
+        )
+
+        match = asyncio.run(index.match("人工A转身"))
+
+        assert match is not None
+        assert match.match_type == "contains"
+        assert match.entry.row == 2
+
+
+def test_semantic_priority_uses_threshold_070_and_top1_without_margin():
     entries = [_entry(2, "旋转身体"), _entry(3, "弯曲身体")]
     backend = _SemanticEmbed(
         [[1.0, 0.0], [0.99, math.sqrt(1.0 - 0.99**2)]],
@@ -203,4 +291,3 @@ def test_concurrent_first_queries_build_document_vectors_once():
     assert all(match is not None for match in matches)
     assert backend.embed_calls == 1
     assert backend.embed_one_calls == 20
-

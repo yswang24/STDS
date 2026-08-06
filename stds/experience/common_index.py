@@ -1,4 +1,4 @@
-"""请求级 Common_Chart 关键词优先、语义回退索引。"""
+"""请求级 Common_Chart 语义优先、关键词回退索引。"""
 from __future__ import annotations
 
 import asyncio
@@ -67,9 +67,10 @@ def _backend_available(backend: Optional[EmbedBackend]) -> bool:
 class CommonChartSemanticIndex:
     """Common_Chart 请求级索引。
 
-    匹配顺序固定为关键词精确、最长单向包含、语义 Top1。词法层一旦有
-    候选但输出冲突，立即返回 ``None``。文档向量首次需要时才构建；同一
-    实例上的并发首次查询由一把异步锁合并为一次构建。
+    匹配顺序固定为语义 Top1、关键词精确、最长单向包含。语义分数达到
+    阈值时直接返回；低分或语义后端不可用时才沿用确定性关键词结果。
+    文档向量首次需要时才构建；同一实例上的并发首次查询由一把异步锁
+    合并为一次构建。
     """
 
     def __init__(
@@ -134,49 +135,52 @@ class CommonChartSemanticIndex:
                 return False
 
     async def match(self, operation_des: str) -> Optional[CommonChartMatch]:
-        """返回关键词命中，或无词法候选时阈值 0.70 的语义 Top1。"""
-        keyword_match, had_keyword_candidate = _match_common_chart_keywords(
+        """优先返回阈值 0.70 的语义 Top1，否则回退关键词匹配。"""
+        if not str(operation_des or "").strip():
+            return None
+
+        if await self._ensure_semantic_vectors():
+            if self._embed is not None and self._semantic_vectors is not None:
+                try:
+                    query_vector = await asyncio.to_thread(
+                        self._embed.embed_one,
+                        operation_des,
+                    )
+                    if (
+                        _backend_available(self._embed)
+                        and _valid_vectors([query_vector], 1)
+                    ):
+                        scored = [
+                            (_cosine(query_vector, vector), entry)
+                            for entry, vector in zip(
+                                self.entries,
+                                self._semantic_vectors,
+                            )
+                        ]
+                        # Top1 only，不设 margin；同分时按 Excel 行号稳定选择。
+                        score, entry = min(
+                            scored,
+                            key=lambda item: (-item[0], item[1].row),
+                        )
+                        if (
+                            math.isfinite(score)
+                            and score >= self.similarity_threshold
+                        ):
+                            return CommonChartMatch(
+                                entry=entry,
+                                keyword="",
+                                match_type="semantic",
+                                similarity=float(score),
+                            )
+                except Exception:
+                    # 查询异常不影响确定性关键词路径。
+                    pass
+
+        keyword_match, _ = _match_common_chart_keywords(
             operation_des,
             self.entries,
         )
-        if keyword_match is not None:
-            return keyword_match
-        if had_keyword_candidate:
-            return None
-        if not str(operation_des or "").strip():
-            return None
-        if not await self._ensure_semantic_vectors():
-            return None
-        if self._embed is None or self._semantic_vectors is None:
-            return None
-
-        try:
-            query_vector = await asyncio.to_thread(
-                self._embed.embed_one,
-                operation_des,
-            )
-        except Exception:
-            return None
-        if (
-            not _backend_available(self._embed)
-            or not _valid_vectors([query_vector], 1)
-        ):
-            return None
-
-        scored = [
-            (_cosine(query_vector, vector), entry)
-            for entry, vector in zip(self.entries, self._semantic_vectors)
-        ]
-        # Top1 only，不设 margin；同分时按 Excel 行号稳定选择。
-        score, entry = min(scored, key=lambda item: (-item[0], item[1].row))
-        if score < self.similarity_threshold:
-            return None
-        return CommonChartMatch(
-            entry=entry,
-            keyword="",
-            match_type="semantic",
-            similarity=float(score),
-        )
+        return keyword_match
 
 
 __all__ = ["CommonChartSemanticIndex", "common_semantic_document"]
