@@ -199,6 +199,31 @@ def test_loader_disables_only_invalid_common_rows():
     })
 
 
+def test_loader_preserves_original_keyword_column_names_after_filtering():
+    source = _workbook_bytes([
+        _row(
+            1,
+            "托盘安装",
+            None,
+            "EST V00",
+            "V",
+            1,
+            2,
+            "拿取",
+            None,
+            "托盘落位",
+            "拿取",
+        ),
+    ])
+
+    result = load_experience_workbook(source, _charts())
+
+    assert len(result.common_entries) == 1
+    entry = result.common_entries[0]
+    assert entry.keywords == ("拿取", "托盘落位")
+    assert entry.keyword_fields == ("关键词描述1", "关键词描述3")
+
+
 def _entry(
     row: int,
     keyword: str,
@@ -236,6 +261,7 @@ def test_matcher_uses_exact_then_longest_and_never_reverse_contains():
     assert exact is not None
     assert exact.entry.row == 2
     assert exact.match_type == "exact"
+    assert exact.matched_field == "关键词描述1"
     assert longest is not None
     assert longest.entry.row == 3
     assert longest.keyword == "转身90"

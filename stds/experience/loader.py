@@ -416,6 +416,7 @@ def _load_common_entries(
 
         keywords: list[str] = []
         normalized_keywords: list[str] = []
+        keyword_fields: list[str] = []
         seen_keywords: set[str] = set()
         for keyword, field_name in raw_keywords:
             if not keyword:
@@ -439,6 +440,7 @@ def _load_common_entries(
             seen_keywords.add(normalized_keyword)
             keywords.append(keyword)
             normalized_keywords.append(normalized_keyword)
+            keyword_fields.append(field_name)
         if not keywords:
             issues.append(ExperienceIssue(
                 "warning",
@@ -532,6 +534,7 @@ def _load_common_entries(
             row=row_number,
             kind=kind,
             values=dict(values),
+            keyword_fields=tuple(keyword_fields),
         ))
 
     # 保留歧义项供运行时基于更长关键词消歧，但在上传阶段显式告警。

@@ -4,6 +4,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
+import pytest
+
 from stds.cascade.resolver import Deps, resolve
 from stds.data.cache import AutoCache
 from stds.data.charts_loader import load_charts
@@ -67,6 +69,9 @@ class _TurnBendExperienceIndex:
             ),
         }
 
+    def chartcode_contexts(self):
+        return tuple(self.contexts.values())
+
     async def match_chartcode_semantic(
         self,
         operation_des,
@@ -92,16 +97,23 @@ class _IndependentExperienceIndex:
     def __init__(self, chart_context, parameter_context):
         self.chart_context = chart_context
         self.parameter_context = parameter_context
-        self.chart_calls = []
+        self.chart_context_calls = 0
         self.parameter_calls = []
+
+    def chartcode_contexts(self):
+        self.chart_context_calls += 1
+        return (
+            (self.chart_context,)
+            if self.chart_context is not None
+            else ()
+        )
 
     async def match_chartcode_semantic(
         self,
         operation_des,
         expected_chartcode=None,
     ):
-        self.chart_calls.append((operation_des, expected_chartcode))
-        return self.chart_context
+        raise AssertionError("生产选码链路不应再调用向量 Top1 接口")
 
     async def match_parameters(
         self,
@@ -139,6 +151,17 @@ def _element(number: int, operation: str) -> StdsElement:
     )
 
 
+async def _select_experience_by_operation(
+    operation_des,
+    contexts,
+    _charts,
+):
+    for index, context in enumerate(contexts):
+        if context.operation_label in operation_des:
+            return index, f"动作匹配{context.operation_label}"
+    return None, "没有匹配的经验行"
+
+
 def test_llm_selected_chartcode_still_uses_independent_parameter_pool():
     charts = load_charts()
     parameter_context = _ExperienceContext(
@@ -166,10 +189,16 @@ def test_llm_selected_chartcode_still_uses_independent_parameter_pool():
         selector_calls.append(operation_des)
         return "202 010"
 
+    async def select_chartcode_experience_must_not_run(*_args):
+        raise AssertionError("没有 Chartcode 经验候选时不应调用经验选择器")
+
     deps = Deps(
         charts=charts,
         cache=AutoCache(),
         llm_select_chartcode=select_chartcode,
+        llm_select_chartcode_experience=(
+            select_chartcode_experience_must_not_run
+        ),
         experience_index=experience_index,
     )
 
@@ -178,6 +207,7 @@ def test_llm_selected_chartcode_still_uses_independent_parameter_pool():
     )
 
     assert selector_calls == ["人工A向右转身"]
+    assert experience_index.chart_context_calls == 1
     assert experience_index.parameter_calls == [
         ("人工A向右转身", "202 010")
     ]
@@ -283,10 +313,14 @@ def test_semantic_experience_toggle_off_forces_llm_chartcode_selection():
     async def pick_first(_operation_des, _candidates):
         return _candidates[0], 1.0, "test"
 
+    async def experience_selector_must_not_run(*_args):
+        raise AssertionError("关闭经验选码时不应调用经验 LLM")
+
     deps = Deps(
         charts=charts,
         cache=AutoCache(),
         llm_select_chartcode=select_chartcode,
+        llm_select_chartcode_experience=experience_selector_must_not_run,
         llm_pick_value=pick_first,
         experience_index=ExperienceIndex(
             [chart_entry],
@@ -356,7 +390,150 @@ def test_lexical_only_experience_api_cannot_select_chartcode():
     )
 
 
-def test_semantic_chart_experience_keeps_its_own_bound_parameter_record():
+def test_chartcode_experience_llm_receives_full_rows_and_audits_selection():
+    charts = load_charts()
+    turn = ExperienceEntry(
+        experience_id="EXP-TURN-202010",
+        operation_label="转身",
+        normalized_operation="转身",
+        chartcode="202 010",
+        chart_row=2,
+        parameter_row=2,
+        parameter_text="转身参数经验",
+        variable_hints={
+            1: "默认选择 Turn",
+            2: "默认选择 180°",
+            3: "默认选择 No Bend",
+        },
+    )
+    bend = ExperienceEntry(
+        experience_id="EXP-BEND-202010",
+        operation_label="弯腰",
+        normalized_operation="弯腰",
+        chartcode="202 010",
+        chart_row=4,
+        parameter_row=4,
+        parameter_text="弯腰参数经验",
+        variable_hints={
+            1: "默认选择 No Twist or Turn",
+            3: "默认选择 45 Body Bend",
+        },
+    )
+    move = ExperienceEntry(
+        experience_id="EXP-MOVE-050222",
+        operation_label="移动",
+        normalized_operation="移动",
+        chartcode="050 222",
+        chart_row=8,
+    )
+    index = ExperienceIndex(
+        [move, bend, turn],
+        source_name="full-experience.xlsx",
+    )
+    selector_calls = []
+
+    async def select_chartcode_experience(operation_des, contexts, available):
+        selector_calls.append((operation_des, tuple(contexts), available))
+        return 1, "动作是弯腰;不是转身"
+
+    async def ordinary_selector_must_not_run(*_args):
+        raise AssertionError("已选中完整经验行，不应调用普通选码")
+
+    result = asyncio.run(resolve(
+        _element(1, "人工A弯腰拿取零件"),
+        Deps(
+            charts=charts,
+            cache=AutoCache(),
+            experience_index=index,
+            llm_select_chartcode=ordinary_selector_must_not_run,
+            llm_select_chartcode_experience=select_chartcode_experience,
+        ),
+        machine_hint=False,
+    ))
+
+    assert len(selector_calls) == 1
+    operation, candidates, available = selector_calls[0]
+    assert operation == "人工A弯腰拿取零件"
+    assert available is charts
+    assert [candidate.experience_id for candidate in candidates] == [
+        "EXP-TURN-202010",
+        "EXP-BEND-202010",
+        "EXP-MOVE-050222",
+    ]
+    assert [candidate.chartcode for candidate in candidates[:2]] == [
+        "202 010",
+        "202 010",
+    ]
+    assert result.chartcode == "202 010"
+    assert result.decision == "NTT,45B"
+
+    chart_trace = next(
+        step for step in result.trace if step[0] == "ExperienceChartcode"
+    )
+    assert "EXP-BEND-202010" in chart_trace[2]
+    assert "candidate_count=3" in chart_trace[2]
+    assert "selected_index=1" in chart_trace[2]
+    assert "reason=动作是弯腰，不是转身" in chart_trace[2]
+    parameter_trace = next(
+        step for step in result.trace if step[0] == "ExperienceParameter"
+    )
+    assert "EXP-BEND-202010" in parameter_trace[2]
+    assert "mode=bound-chartcode-experience" in parameter_trace[2]
+
+
+@pytest.mark.parametrize("selector_result", ["none", "invalid", "exception"])
+def test_chartcode_experience_selection_failure_falls_back_to_ordinary_llm(
+    selector_result,
+):
+    charts = load_charts()
+    entry = ExperienceEntry(
+        experience_id="EXP-TURN-202010",
+        operation_label="转身",
+        normalized_operation="转身",
+        chartcode="202 010",
+        chart_row=2,
+    )
+    experience_calls = []
+    ordinary_calls = []
+
+    async def select_chartcode_experience(operation_des, contexts, available):
+        experience_calls.append((operation_des, tuple(contexts), available))
+        if selector_result == "exception":
+            raise RuntimeError("selector unavailable")
+        if selector_result == "invalid":
+            return len(contexts), "越界索引"
+        return None, "没有匹配的经验"
+
+    async def select_chartcode(operation_des, available):
+        ordinary_calls.append((operation_des, available))
+        return "202 010"
+
+    async def pick_first(_operation_des, candidates, **_kwargs):
+        return candidates[0], 1.0, "ordinary-llm"
+
+    result = asyncio.run(resolve(
+        _element(1, "人工A调整身体姿态"),
+        Deps(
+            charts=charts,
+            cache=AutoCache(),
+            experience_index=ExperienceIndex([entry]),
+            llm_select_chartcode_experience=select_chartcode_experience,
+            llm_select_chartcode=select_chartcode,
+            llm_pick_value=pick_first,
+        ),
+        machine_hint=False,
+    ))
+
+    assert len(experience_calls) == 1
+    assert len(experience_calls[0][1]) == 1
+    assert len(ordinary_calls) == 1
+    assert result.chartcode == "202 010"
+    assert not any(
+        step[0] == "ExperienceChartcode" for step in result.trace
+    )
+
+
+def test_llm_selected_chart_experience_keeps_its_own_bound_parameter_record():
     charts = load_charts()
     chart_context = _ExperienceContext(
         experience_id="CHART-BODY-202010",
@@ -395,10 +572,19 @@ def test_semantic_chart_experience_keeps_its_own_bound_parameter_record():
     async def chart_selector_must_not_run(operation_des, available_charts):
         raise AssertionError("Chartcode 经验已选码，不应调用 LLM")
 
+    experience_selector_calls = []
+
+    async def select_chartcode_experience(operation_des, contexts, charts):
+        experience_selector_calls.append(
+            (operation_des, tuple(contexts), charts)
+        )
+        return 0, "当前动作更符合身体姿态调整"
+
     deps = Deps(
         charts=charts,
         cache=AutoCache(),
         llm_select_chartcode=chart_selector_must_not_run,
+        llm_select_chartcode_experience=select_chartcode_experience,
         experience_index=experience_index,
     )
 
@@ -406,9 +592,10 @@ def test_semantic_chart_experience_keeps_its_own_bound_parameter_record():
         resolve(_element(1, "人工A向右转身"), deps, machine_hint=False)
     )
 
-    assert experience_index.chart_calls == [
-        ("人工A向右转身", None)
-    ]
+    assert experience_index.chart_context_calls == 1
+    assert len(experience_selector_calls) == 1
+    assert experience_selector_calls[0][0] == "人工A向右转身"
+    assert experience_selector_calls[0][1] == (chart_context,)
     assert experience_index.parameter_calls == []
     assert result.decision == "NTT,45B"
     chart_trace = next(
@@ -453,10 +640,17 @@ def test_modern_index_falls_back_to_attached_legacy_parameter_hints():
     async def chart_selector_must_not_run(operation_des, available_charts):
         raise AssertionError("旧 Chartcode 经验已选码，不应调用 LLM")
 
+    async def select_chartcode_experience(_operation, contexts, _charts):
+        assert [context.experience_id for context in contexts] == [
+            "LEGACY-TURN-202010"
+        ]
+        return 0, "仅有的经验行符合转身"
+
     deps = Deps(
         charts=charts,
         cache=AutoCache(),
         llm_select_chartcode=chart_selector_must_not_run,
+        llm_select_chartcode_experience=select_chartcode_experience,
         experience_index=experience_index,
     )
 
@@ -474,7 +668,7 @@ def test_modern_index_falls_back_to_attached_legacy_parameter_hints():
     assert "mode=bound-chartcode-experience" in parameter_trace[2]
 
 
-def test_semantic_chart_hit_does_not_switch_to_another_parameter_record():
+def test_llm_chart_experience_does_not_switch_to_another_parameter_record():
     charts = load_charts()
     chart_entry = ExperienceEntry(
         experience_id="CHART-TURN-202010",
@@ -508,10 +702,17 @@ def test_semantic_chart_hit_does_not_switch_to_another_parameter_record():
         embed_backend=_AlignedEmbed(),
     )
 
+    async def select_chartcode_experience(_operation, contexts, _charts):
+        assert [context.experience_id for context in contexts] == [
+            "CHART-TURN-202010"
+        ]
+        return 0, "选择转身经验"
+
     deps = Deps(
         charts=charts,
         cache=AutoCache(),
         experience_index=experience_index,
+        llm_select_chartcode_experience=select_chartcode_experience,
     )
 
     result = asyncio.run(
@@ -603,9 +804,7 @@ def test_llm_chart_does_not_requery_chart_experience_for_parameters():
         resolve(_element(1, "人工A向右转身"), deps, machine_hint=False)
     )
 
-    assert experience_index.chart_calls == [
-        ("人工A向右转身", None),
-    ]
+    assert experience_index.chart_calls == []
     assert experience_index.parameter_calls == [
         ("人工A向右转身", "202 010")
     ]
@@ -632,6 +831,7 @@ def test_same_chartcode_keeps_turn_and_bend_parameter_identity():
         charts=charts,
         cache=AutoCache(),
         llm_select_chartcode=chart_selector_must_not_run,
+        llm_select_chartcode_experience=_select_experience_by_operation,
         experience_index=_TurnBendExperienceIndex(),
         experience_scope="experience-digest",
     )
@@ -767,6 +967,7 @@ def test_shared_angle_chart_applies_explicit_angle_to_correct_action_only():
         charts=charts,
         cache=AutoCache(),
         llm_select_chartcode=chart_selector_must_not_run,
+        llm_select_chartcode_experience=_select_experience_by_operation,
         experience_index=_TurnBendExperienceIndex(),
         experience_scope="experience-digest",
     )

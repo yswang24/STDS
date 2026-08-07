@@ -151,20 +151,23 @@ with st.sidebar:
         "启用 T0.5 Common Chart",
         key="use_common_chart",
         help=(
-            "开启时优先使用当前上传经验文件中 Common_Chart "
-            "的高频动作快速匹配；默认语义 Top1@0.70 优先，低分或"
-            "向量不可用时回退关键词。关闭时跳过 T0.5，继续使用后续"
-            " kNN/LLM 工时分析。"
+            "开启时为 Common_Chart 每行的“操作内容”和每个有效"
+            "“关键词描述1～8”分别建立向量，输入与全部单元格比较并取"
+            "全局 Top1@0.70，达标后按所属 Excel 行回取整行；低分或"
+            "向量不可用时回退关键词。关闭时跳过 T0.5，继续使用后续 kNN/LLM"
+            "工时分析。"
         ),
     )
     use_semantic_experience = st.toggle(
-        "启用经验语义向量检索",
+        "启用上传经验辅助选码",
         key="use_semantic_experience",
         help=(
-            "默认开启。用于 Chartcode 经验的语义 Top1 选择"
-            "（阈值 0.70），"
-            "也用于 Common Chart 的语义 Top1 优先匹配；"
-            "关闭或向量不可用时，Common Chart 回退关键词匹配。"
+            "默认开启。Common Chart 先对“操作内容/有效关键词”"
+            "单元格做全局语义 Top1@0.70，低分或向量不可用时回退"
+            "关键词；Common 完整未命中后，把上传文件"
+            "中的全部有效 Chartcode 选择经验交给 LLM 选择一行，并严格"
+            "绑定该行的参数经验。关闭后跳过 Chartcode 经验辅助选码，"
+            "Common Chart 只做关键词匹配。"
         ),
     )
 
@@ -344,9 +347,10 @@ experience_file = st.file_uploader(
     key="stds_experience_workbook",
     help=(
         "支持 STDS评估经验V1.2.xlsx 中的 Chartcode 选择、"
-        "参数选择和 Common_Chart 经验。经验语义命中 Chartcode 时"
-        "严格绑定同一条参数经验；Chartcode 由 LLM 选择时，"
-        "系统会汇总该码下全部参数经验，让模型选择一整条后全程沿用。"
+        "参数选择和 Common_Chart 经验。Common 未命中后，全部有效"
+        "Chartcode 经验会交给 LLM 选择一行，并严格绑定该行的参数经验；"
+        "若经验选码未成功，则从数据库普通 Chartcode 中选择，并汇总该码"
+        "下全部参数经验，让模型选择一整条后全程沿用。"
     ),
 )
 manual_decomposition_review = st.toggle(
@@ -1032,7 +1036,7 @@ if (
         f"{'已启用' if batch_output['use_common_chart'] else '已关闭'}"
     )
     st.caption(
-        "本次分析的经验语义向量检索："
+        "本次分析的上传经验辅助选码："
         f"{'已启用' if batch_output['use_semantic_experience'] else '已关闭'}"
     )
     st.caption(
@@ -1259,7 +1263,7 @@ if single_output is not None:
         f"工时分析阶段 {single_analysis.analysis_elapsed_s:.2f} 秒｜"
         f"状态：{single_analysis.status}｜T0.5 Common Chart："
         f"{'已启用' if single_use_common_chart else '已关闭'}｜"
-        "经验语义向量检索："
+        "上传经验辅助选码："
         f"{'已启用' if single_use_semantic_experience else '已关闭'}｜LLM："
         + (
             f"Ollama / {single_llm_signature[2]}"

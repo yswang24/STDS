@@ -95,16 +95,23 @@ def _match_common_chart_keywords(
     if len(signatures) != 1:
         return None, True
 
-    entry, keyword, _, _ = min(
+    entry, keyword, _, keyword_index = min(
         eligible,
         key=lambda candidate: (candidate[0].row, candidate[3]),
     )
+    keyword_fields = tuple(getattr(entry, "keyword_fields", ()) or ())
+    matched_field = (
+        str(keyword_fields[keyword_index]).strip()
+        if keyword_index < len(keyword_fields)
+        else ""
+    ) or f"关键词描述{keyword_index + 1}"
     return (
         CommonChartMatch(
             entry=entry,
             keyword=keyword,
             match_type=match_type,
             similarity=1.0,
+            matched_field=matched_field,
         ),
         True,
     )

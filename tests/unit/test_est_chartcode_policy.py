@@ -141,24 +141,27 @@ def test_explicit_experience_can_select_est_code():
         source_name = "test-experience.xlsx"
         parameter_records = ()
 
-        async def match_chartcode_semantic(
-            self,
-            _operation,
-            *,
-            expected_chartcode=None,
-        ):
-            if expected_chartcode not in (None, "EST C00"):
-                return None
-            return SimpleNamespace(
-                experience_id="est-c00",
-                operation_label="黏贴",
-                chartcode="EST C00",
-                match_type="semantic",
-                similarity=1.0,
-                chart_row=2,
-                parameter_row=None,
-                variable_hints={},
+        def chartcode_contexts(self):
+            return (
+                SimpleNamespace(
+                    experience_id="est-c00",
+                    operation_label="黏贴",
+                    chartcode="EST C00",
+                    match_type="llm-candidate",
+                    similarity=0.0,
+                    chart_row=2,
+                    parameter_row=None,
+                    parameter_text="",
+                    variable_hints={},
+                ),
             )
+
+    experience_selector_calls = []
+
+    async def select_est_experience(operation, contexts, charts):
+        experience_selector_calls.append((operation, tuple(contexts), charts))
+        assert [context.chartcode for context in contexts] == ["EST C00"]
+        return 0, "明确匹配黏贴固定时间经验"
 
     async def selector_must_not_run(_operation, _charts):
         raise AssertionError("明确 EST 经验命中后不应调用普通 LLM 选码")
@@ -172,6 +175,7 @@ def test_explicit_experience_can_select_est_code():
             experience_scope="experience:test",
             llm_classify=_human,
             llm_select_chartcode=selector_must_not_run,
+            llm_select_chartcode_experience=select_est_experience,
             llm_pick_value=_first_option,
         ),
     ))
@@ -181,3 +185,10 @@ def test_explicit_experience_can_select_est_code():
     assert result.decision == "5S"
     assert result.time_s == 5.0
     assert result.cv == "C"
+    assert len(experience_selector_calls) == 1
+    chart_trace = next(
+        step for step in result.trace if step[0] == "ExperienceChartcode"
+    )
+    assert "candidate_count=1" in chart_trace[2]
+    assert "selected_index=0" in chart_trace[2]
+    assert "reason=明确匹配黏贴固定时间经验" in chart_trace[2]

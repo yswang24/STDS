@@ -1,7 +1,7 @@
-"""LLM chartcode 选择:参考 Dify 的 LLM chartcode选择节点。
+"""数据库普通 Chartcode 的 LLM 兜底选择。
 
-64 个 chartcode 中排除 2 个 EST 经验专用码，其余 62 个给 LLM 选。
-common_chart 的 T0.5 已覆盖 33 条高频(中文关键词精确匹配),这里处理剩余的。
+Common 与上传 Chartcode 经验都未形成有效命中时，从图表库中排除
+``EST C00/V00``，再把其余普通图表的代码和标题交给 LLM 选择。
 """
 from __future__ import annotations
 

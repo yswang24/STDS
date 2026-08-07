@@ -84,6 +84,7 @@ class CommonChartEntry:
     row: int
     kind: CommonChartKind
     values: dict[int, float] = field(default_factory=dict)
+    keyword_fields: tuple[str, ...] = ()
 
     @property
     def output_signature(self) -> tuple:
@@ -103,12 +104,13 @@ class CommonChartEntry:
 
 @dataclass(frozen=True)
 class CommonChartMatch:
-    """Common_Chart 关键词命中及其审计信息。"""
+    """Common_Chart 命中结果及其单元格/行级审计信息。"""
 
     entry: CommonChartEntry
     keyword: str
     match_type: str
     similarity: float = 1.0
+    matched_field: str = ""
 
 
 @dataclass(frozen=True)

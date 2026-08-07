@@ -25,6 +25,9 @@ from stds.llm.extract_part_name import (
 )
 from stds.llm.pick_value import pick_value as _default_pick_value
 from stds.llm.select_chartcode import select_chartcode as _default_select_chartcode
+from stds.llm.select_chartcode_experience import (
+    select_chartcode_experience as _default_select_chartcode_experience,
+)
 from stds.llm.select_parameter_experience import (
     select_parameter_experience as _default_select_parameter_experience,
 )
@@ -46,9 +49,10 @@ class Deps:
     common_index: object = None             # Common 语义优先、关键词回退索引
     common_rows: Optional[Sequence] = None # 兼容显式注入的旧参数名；不再读数据库
     use_common_chart: bool = False          # 是否启用 T0.5 快速路径（默认关闭）
-    use_semantic_experience: bool = True    # Chartcode/Common 语义检索（默认开启）
+    use_semantic_experience: bool = True    # Chartcode 经验 LLM/Common 语义（默认开启）
     llm_classify: Callable = None          # async (text) -> bool(设备=True)
     llm_select_chartcode: Callable = None  # async (op_des, charts) -> chartcode or None
+    llm_select_chartcode_experience: Callable = None # async (op, contexts, charts) -> (index, reason)
     llm_select_parameter_experience: Callable = None # async (op, cc, contexts) -> (index, reason)
     llm_pick_value: Callable = None        # async (op_des, cands) -> (VOption, conf, reason)
     history_index: object = None           # T1 kNN(可选)
@@ -69,6 +73,10 @@ class Deps:
             self.llm_classify = classify_machine
         if self.llm_select_chartcode is None:
             self.llm_select_chartcode = _default_select_chartcode
+        if self.llm_select_chartcode_experience is None:
+            self.llm_select_chartcode_experience = (
+                _default_select_chartcode_experience
+            )
         if self.llm_select_parameter_experience is None:
             self.llm_select_parameter_experience = (
                 _default_select_parameter_experience
@@ -143,54 +151,74 @@ def _chart_key(chartcode: object, charts: dict) -> Optional[str]:
     return matches[0] if len(matches) == 1 else None
 
 
-async def _match_experience(
+async def _select_chartcode_experience(
     operation_des: str,
     deps: Deps,
-    *,
-    expected_chartcode: Optional[str] = None,
 ):
-    """以语义 Top1 匹配一个属于当前图表库的 Chartcode 经验。"""
+    """把全部有效 Chartcode 经验行一次性交给 LLM 选择。"""
     if (
         not _experience_enabled(deps)
         or not bool(getattr(deps, "use_semantic_experience", True))
     ):
-        return None, None
+        return None, None, ""
+
     index = deps.experience_index
-    matcher = getattr(index, "match_chartcode_semantic", None)
-    if not callable(matcher):
+    getter = getattr(index, "chartcode_contexts", None)
+    if not callable(getter):
         logger.warning(
-            "  [Experience] 当前经验索引不支持纯语义 Chartcode API，已跳过"
+            "  [Experience] 当前经验索引不支持全量 Chartcode 候选 API，已跳过"
         )
-        return None, None
+        return None, None, ""
     try:
-        context = await matcher(
+        raw_contexts = tuple(getter() or ())
+    except Exception:
+        logger.exception("  [Experience] 全量 Chartcode 经验读取失败")
+        return None, None, ""
+
+    contexts = [
+        context
+        for context in raw_contexts
+        if _chart_key(getattr(context, "chartcode", None), deps.charts) is not None
+    ]
+    if not contexts:
+        return None, None, ""
+
+    try:
+        selected_index, reason = await deps.llm_select_chartcode_experience(
             operation_des,
-            expected_chartcode=expected_chartcode,
+            contexts,
+            deps.charts,
         )
     except Exception:
-        logger.exception(
-            "  [Experience] 经验匹配失败(expected_chartcode=%r)，沿用原逻辑",
-            expected_chartcode,
+        logger.exception("  [Experience] LLM 全量 Chartcode 经验选择失败")
+        return None, None, ""
+    if type(selected_index) is not int or not (
+        0 <= selected_index < len(contexts)
+    ):
+        logger.info(
+            "  [Experience] LLM 未选择有效 Chartcode 经验: index=%r count=%s",
+            selected_index,
+            len(contexts),
         )
-        return None, None
-    if context is None:
-        return None, None
+        return None, None, ""
+
+    context = contexts[selected_index]
     chartcode = _chart_key(getattr(context, "chartcode", None), deps.charts)
     if chartcode is None:
-        logger.warning(
-            "  [Experience] 经验 %r 的 Chartcode=%r 不在当前图表库，已忽略",
-            getattr(context, "experience_id", ""),
-            getattr(context, "chartcode", None),
-        )
-        return None, None
-    if expected_chartcode is not None and chartcode != expected_chartcode:
-        logger.warning(
-            "  [Experience] 约束匹配返回了其他 Chartcode: expected=%s actual=%s",
-            expected_chartcode,
-            chartcode,
-        )
-        return None, None
-    return context, chartcode
+        return None, None, ""
+    try:
+        context = replace(context, match_type="llm", similarity=0.0)
+    except TypeError:
+        # 兼容外部实现的只读 context；审计模式仍记录在 selection_mode。
+        pass
+    safe_reason = str(reason or "").replace(";", "，").strip()
+    selection_mode = (
+        "llm-all-chartcode-experiences;"
+        f"candidate_count={len(contexts)};"
+        f"selected_index={selected_index};"
+        f"reason={safe_reason}"
+    )
+    return context, chartcode, selection_mode
 
 
 async def _match_parameter_experience(
@@ -202,7 +230,7 @@ async def _match_parameter_experience(
 ):
     """为最终 Chartcode 选择一整条参数经验，并贯穿所有 Vn。
 
-    Chartcode 若由经验语义 Top1 选出，参数必须绑定到同一经验身份；
+    Chartcode 若由全量经验 LLM 选出，参数必须绑定到同一经验身份；
     Chartcode 若由 LLM 选出，则把该码下全部有效参数经验一次性交给 LLM
     选择，禁止在后续遍历中混用多条记录。
     """
@@ -229,7 +257,7 @@ async def _match_parameter_experience(
     index = deps.experience_index
     getter = getattr(index, "parameter_contexts_for_chartcode", None)
 
-    # 语义经验已经选中具体 Chartcode 行：参数只能来自同一经验身份。
+    # 全量经验 LLM 已选中具体 Chartcode 行：参数只能来自同一经验身份。
     if chart_experience_context is not None:
         matched_chartcode = _chart_key(
             getattr(chart_experience_context, "chartcode", None),
@@ -773,11 +801,19 @@ async def resolve(
                     getattr(deps.experience_index, "source_name", "")
                     or deps.experience_scope
                 )
+                matched_field = str(
+                    getattr(cc_hit, "matched_field", "") or ""
+                ).replace(";", "，").strip()
+                matched_cell_text = str(
+                    getattr(cc_hit, "keyword", "") or ""
+                ).replace(";", "，").strip()
                 common_trace = (
                     "T0.5_common",
                     entry.operation_label,
                     (
-                        f"match={cc_hit.match_type};keyword={cc_hit.keyword};"
+                        f"match={cc_hit.match_type};"
+                        f"cell={matched_field};cell_text={matched_cell_text};"
+                        f"keyword={matched_cell_text};"
                         f"similarity={float(cc_hit.similarity):.4f};"
                         f"sheet=Common_Chart;row={entry.row};"
                         f"source={common_source}"
@@ -888,20 +924,23 @@ async def resolve(
         logger.info(f"  → 结果: 设备动作,跳过计算")
         return StdsResult.machine_placeholder(el)
 
-    # T3E 只用语义向量 Top1 匹配 Chartcode 经验；低于 0.70 才交给 LLM。
-    chart_experience_context, experience_cc = await _match_experience(op, deps)
-    chart_experience_mode = ""
+    # T3E 将上传文件中的全部有效 Chartcode 经验行一次性交给 LLM。
+    # LLM 选择的是经验行而非去重后的代码，确保同码动作仍绑定各自参数。
+    (
+        chart_experience_context,
+        experience_cc,
+        chart_experience_mode,
+    ) = await _select_chartcode_experience(op, deps)
     if chart_experience_context is not None:
         cc = experience_cc
-        chart_experience_mode = "semantic-top1;threshold=0.70"
         logger.info(
-            "  [T3E] 经验选码: %s / operation=%r / experience_id=%s",
+            "  [T3E] LLM 全量经验选码: %s / operation=%r / experience_id=%s",
             cc,
             getattr(chart_experience_context, "operation_label", ""),
             getattr(chart_experience_context, "experience_id", ""),
         )
     else:
-        # 没有唯一可靠动作经验时沿用原 LLM 选择。
+        # 没有被 LLM 选中的上传经验时，沿用数据库普通 Chartcode 选择。
         llm_charts = general_chart_candidates(deps.charts)
         cc = await deps.llm_select_chartcode(op, llm_charts)
         if is_experience_only_chartcode(cc):

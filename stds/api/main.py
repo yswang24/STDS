@@ -216,7 +216,7 @@ async def start_job(req: JobRequest):
     job_id = str(uuid.uuid4())[:8]
     deps_options = {"use_common_chart": req.use_common_chart}
     # 默认值由 _get_deps 契约提供，保留已有只代理 Common
-    # 开关的调用方；显式关闭时才需要覆盖默认语义模式。
+    # 开关的调用方；显式关闭时才需要覆盖默认经验辅助模式。
     if not req.use_semantic_experience:
         deps_options["use_semantic_experience"] = False
     if experience_context is None:

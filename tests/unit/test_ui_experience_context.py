@@ -48,27 +48,32 @@ def test_common_enabled_without_uploaded_common_blocks_both_entry_points():
     assert single_button.disabled is True
 
 
-def test_semantic_experience_toggle_defaults_on_and_is_independent_from_common():
+def test_uploaded_experience_assist_toggle_defaults_on_and_is_independent_from_common():
     app = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
 
-    semantic_toggle = next(
+    experience_toggle = next(
         toggle for toggle in app.toggle
-        if toggle.label == "启用经验语义向量检索"
+        if toggle.label == "启用上传经验辅助选码"
     )
     common_toggle = next(
         toggle for toggle in app.toggle
         if toggle.label == "启用 T0.5 Common Chart"
     )
-    assert semantic_toggle.value is True
-    assert semantic_toggle.disabled is False
+    assert experience_toggle.value is True
+    assert experience_toggle.disabled is False
+    assert "单元格" in experience_toggle.help
+    assert "全局语义 Top1@0.70" in experience_toggle.help
+    assert "全部有效 Chartcode 选择经验" in experience_toggle.help
+    assert "每个有效" in common_toggle.help
+    assert "所属 Excel 行回取整行" in common_toggle.help
 
     common_toggle.set_value(False).run()
-    semantic_toggle = next(
+    experience_toggle = next(
         toggle for toggle in app.toggle
-        if toggle.label == "启用经验语义向量检索"
+        if toggle.label == "启用上传经验辅助选码"
     )
-    assert semantic_toggle.value is True
-    assert semantic_toggle.disabled is False
+    assert experience_toggle.value is True
+    assert experience_toggle.disabled is False
 
 
 def test_switching_or_removing_experience_upload_invalidates_old_outputs(

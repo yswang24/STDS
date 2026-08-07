@@ -8,7 +8,11 @@ from types import SimpleNamespace
 
 from openpyxl import Workbook
 
-from stds.experience import load_experience_workbook
+from stds.experience import (
+    ExperienceEntry,
+    ExperienceIndex,
+    load_experience_workbook,
+)
 
 
 def _workbook_bytes(chart_rows, parameter_rows, *, with_ids=False) -> bytes:
@@ -465,6 +469,51 @@ def test_lexical_conflict_returns_none_but_expected_chartcode_can_disambiguate()
     )
     assert selected is not None
     assert selected.chartcode == "050 222"
+
+
+def test_chartcode_contexts_are_stably_sorted_without_chartcode_deduplication():
+    entries = [
+        ExperienceEntry(
+            experience_id="EXP-MOVE",
+            operation_label="移动",
+            normalized_operation="移动",
+            chartcode="050 222",
+            chart_row=9,
+        ),
+        ExperienceEntry(
+            experience_id="EXP-TURN-B",
+            operation_label="转身B",
+            normalized_operation="转身b",
+            chartcode="202 010",
+            chart_row=4,
+        ),
+        ExperienceEntry(
+            experience_id="EXP-TURN-A",
+            operation_label="转身A",
+            normalized_operation="转身a",
+            chartcode="202 010",
+            chart_row=4,
+            parameter_row=12,
+            parameter_text="参数V1：选择Turn",
+            variable_hints={1: "选择Turn"},
+        ),
+    ]
+    index = ExperienceIndex(entries)
+
+    first = index.chartcode_contexts()
+    second = index.chartcode_contexts()
+
+    assert [context.experience_id for context in first] == [
+        "EXP-TURN-A",
+        "EXP-TURN-B",
+        "EXP-MOVE",
+    ]
+    assert [context.chartcode for context in first].count("202 010") == 2
+    assert first == second
+    assert all(context.match_type == "llm-candidate" for context in first)
+    assert all(context.similarity == 0.0 for context in first)
+    assert first[0].parameter_row == 12
+    assert first[0].variable_hints == {1: "选择Turn"}
 
 
 class _SemanticEmbed:

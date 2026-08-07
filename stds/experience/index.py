@@ -108,6 +108,25 @@ class ExperienceIndex:
         """面向 UI/诊断的只读别名。"""
         return self.entries
 
+    def chartcode_contexts(self) -> tuple[ExperienceContext, ...]:
+        """返回全部有效 Chartcode 经验行，供一次性 LLM 选码。
+
+        不按 Chartcode 去重：不同动作可能共用同一图表，但必须保留各自
+        的经验身份，后续参数经验才能严格绑定到 LLM 选中的那一行。
+        """
+        ordered = sorted(
+            self.entries,
+            key=lambda entry: (
+                entry.chart_row,
+                entry.experience_id,
+                entry.normalized_operation,
+            ),
+        )
+        return tuple(
+            self._context(entry, "llm-candidate", 0.0)
+            for entry in ordered
+        )
+
     @property
     def parameter_records(self) -> tuple[ParameterExperienceEntry, ...]:
         """独立参数经验池；不改变 ``records`` 的 Chartcode 记录语义。"""

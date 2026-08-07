@@ -116,6 +116,9 @@ def test_common_semantic_top1_is_used_by_resolver_and_audited():
     assert result.confidence == 0.8
     assert not result.needs_review
     assert "match=semantic" in result.trace[0][2]
+    assert "cell=操作内容" in result.trace[0][2]
+    assert "cell_text=托盘落位" in result.trace[0][2]
+    assert "row=2" in result.trace[0][2]
     assert "similarity=0.8000" in result.trace[0][2]
     assert backend.embed_calls == 1
 
